@@ -1,0 +1,3241 @@
+-- EPL Hyperion 2.0.2 - single LocalScript
+-- Subtitle: Compiler Core Hardening
+-- Place in StarterPlayer > StarterPlayerScripts
+-- Client-side IDE, compiler, VM sandbox & debugger.
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+
+-- ============================================================================
+-- 1. HARDENED CONFIGURATION & RESOURCE LIMITS
+-- ============================================================================
+local CONFIG = {
+    VERSION               = "2.0.2",
+    SUBTITLE              = "Compiler Core Hardening",
+    MAX_SOURCE_BYTES      = 100000,   -- 100 KB max source code
+    MAX_TOKEN_COUNT       = 20000,    -- 20,000 tokens limit
+    MAX_AST_NODES         = 12000,    -- 12,000 AST nodes limit
+    MAX_EXPRESSION_DEPTH  = 128,      -- 128 recursive depth limit
+    MAX_IR_INSTRUCTIONS   = 25000,    -- 25,000 IR instructions limit
+    MAX_REGISTERS         = 4096,     -- 4,096 VM registers per frame
+    MAX_CONSTANTS          = 8192,     -- 8,192 IR constants
+    MAX_CALL_ARGS         = 128,     -- Maximum arguments per VM call
+    MAX_CLOSURE_DEPTH     = 64,       -- Maximum lexical parent depth
+    MAX_LOG_ENTRIES       = 100,      -- Maximum terminal log entries
+    MAX_SHARE_BYTES       = 120000,   -- Maximum encoded share payload
+    MAX_RUNTIME_SEC       = 1.0,      -- 1.0 second VM execution budget
+    MAX_INSTRUCTIONS      = 100000,   -- 100,000 VM opcodes budget
+    MAX_RECURSION_DEPTH   = 64,       -- 64 VM call frames limit
+    MAX_OUTPUT_BYTES      = 10240,    -- 10 KB terminal output buffer
+    WATCHDOG_CHECK_FREQ   = 32,       -- Watchdog checked every 32 instructions
+    DEBOUNCE_DELAY_SEC    = 0.20,     -- Keystroke analysis debouncing delay
+}
+
+-- ============================================================================
+-- 2. DETERMINISTIC FULL-SOURCE HASHING FOR TRANSLATION CACHE
+-- ============================================================================
+local function hashSource(str, fromLang, toLang)
+    local h = 2166136261
+    local prime = 16777619
+    local combined = "v" .. CONFIG.VERSION .. ":" .. fromLang .. "->" .. toLang .. ":" .. str
+    for i = 1, #combined do
+        local b = string.byte(combined, i)
+        if bit32 then
+            h = bit32.bxor(h, b) * prime % 4294967296
+        else
+            h = ((h + b) * prime) % 4294967296
+        end
+    end
+    return string.format("%08x", h)
+end
+
+-- ============================================================================
+-- 3. THEMES & COLOR ENGINE
+-- ============================================================================
+local THEMES = {
+    ["Hyperion Dark"] = {
+        name = "Hyperion Dark",
+        bg = Color3.fromRGB(16, 17, 21),
+        panel = Color3.fromRGB(23, 24, 30),
+        panel2 = Color3.fromRGB(29, 30, 38),
+        border = Color3.fromRGB(52, 54, 65),
+        text = Color3.fromRGB(225, 228, 235),
+        muted = Color3.fromRGB(125, 130, 145),
+        blue = Color3.fromRGB(90, 155, 255),
+        green = Color3.fromRGB(105, 215, 145),
+        yellow = Color3.fromRGB(235, 195, 95),
+        purple = Color3.fromRGB(190, 130, 255),
+        red = Color3.fromRGB(240, 95, 105),
+        cyan = Color3.fromRGB(90, 210, 220),
+        selection = Color3.fromRGB(45, 55, 78),
+        gutter = Color3.fromRGB(19, 20, 25),
+        gutterText = Color3.fromRGB(80, 84, 96),
+        hex = {
+            KEYWORD = "#5A9BFF",
+            STRING = "#69D791",
+            NUMBER = "#EBC35F",
+            COMMENT = "#7D8291",
+            OP = "#C5C8D4",
+            ERROR = "#F05F69",
+            IDENT = "#E1E4EB",
+        }
+    },
+    ["Dracula"] = {
+        name = "Dracula",
+        bg = Color3.fromRGB(40, 42, 54),
+        panel = Color3.fromRGB(52, 55, 70),
+        panel2 = Color3.fromRGB(68, 71, 90),
+        border = Color3.fromRGB(98, 114, 164),
+        text = Color3.fromRGB(248, 248, 242),
+        muted = Color3.fromRGB(140, 145, 175),
+        blue = Color3.fromRGB(139, 233, 253),
+        green = Color3.fromRGB(80, 250, 123),
+        yellow = Color3.fromRGB(241, 250, 140),
+        purple = Color3.fromRGB(189, 147, 249),
+        red = Color3.fromRGB(255, 85, 85),
+        cyan = Color3.fromRGB(139, 233, 253),
+        selection = Color3.fromRGB(68, 71, 90),
+        gutter = Color3.fromRGB(35, 37, 47),
+        gutterText = Color3.fromRGB(98, 114, 164),
+        hex = {
+            KEYWORD = "#FF79C6",
+            STRING = "#F1FA8C",
+            NUMBER = "#BD93F9",
+            COMMENT = "#6272A4",
+            OP = "#8BE9FD",
+            ERROR = "#FF5555",
+            IDENT = "#F8F8F2",
+        }
+    },
+    ["One Dark"] = {
+        name = "One Dark",
+        bg = Color3.fromRGB(33, 37, 43),
+        panel = Color3.fromRGB(40, 44, 52),
+        panel2 = Color3.fromRGB(44, 49, 58),
+        border = Color3.fromRGB(60, 66, 78),
+        text = Color3.fromRGB(171, 178, 191),
+        muted = Color3.fromRGB(115, 122, 135),
+        blue = Color3.fromRGB(97, 175, 239),
+        green = Color3.fromRGB(152, 195, 121),
+        yellow = Color3.fromRGB(229, 192, 123),
+        purple = Color3.fromRGB(198, 120, 221),
+        red = Color3.fromRGB(224, 108, 117),
+        cyan = Color3.fromRGB(86, 182, 194),
+        selection = Color3.fromRGB(62, 68, 81),
+        gutter = Color3.fromRGB(30, 33, 39),
+        gutterText = Color3.fromRGB(92, 99, 112),
+        hex = {
+            KEYWORD = "#C678DD",
+            STRING = "#98C379",
+            NUMBER = "#D19A66",
+            COMMENT = "#5C6370",
+            OP = "#56B6C2",
+            ERROR = "#E06C75",
+            IDENT = "#ABB2BF",
+        }
+    },
+    ["Monokai"] = {
+        name = "Monokai",
+        bg = Color3.fromRGB(39, 40, 34),
+        panel = Color3.fromRGB(49, 51, 44),
+        panel2 = Color3.fromRGB(60, 62, 54),
+        border = Color3.fromRGB(73, 72, 62),
+        text = Color3.fromRGB(248, 248, 242),
+        muted = Color3.fromRGB(136, 136, 126),
+        blue = Color3.fromRGB(102, 217, 239),
+        green = Color3.fromRGB(166, 226, 46),
+        yellow = Color3.fromRGB(230, 219, 116),
+        purple = Color3.fromRGB(174, 129, 255),
+        red = Color3.fromRGB(249, 38, 114),
+        cyan = Color3.fromRGB(102, 217, 239),
+        selection = Color3.fromRGB(73, 72, 62),
+        gutter = Color3.fromRGB(34, 35, 29),
+        gutterText = Color3.fromRGB(117, 113, 94),
+        hex = {
+            KEYWORD = "#F92672",
+            STRING = "#E6DB74",
+            NUMBER = "#AE81FF",
+            COMMENT = "#75715E",
+            OP = "#F92672",
+            ERROR = "#F92672",
+            IDENT = "#F8F8F2",
+        }
+    }
+}
+local currentThemeName = "Hyperion Dark"
+local C = THEMES[currentThemeName]
+
+-- ============================================================================
+-- 4. BASE64 ENCODING & SHARE CODES
+-- ============================================================================
+local BuiltInBase64 = {}
+local B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+local function validateSharePayload(data)
+    if type(data) ~= "string" then error("[Hyperion Share] Payload must be a string", 0) end
+    if #data > CONFIG.MAX_SHARE_BYTES then error(string.format("[Hyperion Share] Payload exceeds %d bytes", CONFIG.MAX_SHARE_BYTES), 0) end
+end
+
+function BuiltInBase64.encode(data)
+    validateSharePayload(data)
+    local bytes = {string.byte(data, 1, #data)}
+    local result = {}
+    for i = 1, #bytes, 3 do
+        local b1, b2, b3 = bytes[i], bytes[i+1], bytes[i+2]
+        local n = (b1 * 65536) + ((b2 or 0) * 256) + (b3 or 0)
+        local c1 = math.floor(n / 262144) % 64 + 1
+        local c2 = math.floor(n / 4096) % 64 + 1
+        local c3 = math.floor(n / 64) % 64 + 1
+        local c4 = n % 64 + 1
+        table.insert(result, B64_CHARS:sub(c1,c1))
+        table.insert(result, B64_CHARS:sub(c2,c2))
+        table.insert(result, b2 and B64_CHARS:sub(c3,c3) or '=')
+        table.insert(result, b3 and B64_CHARS:sub(c4,c4) or '=')
+    end
+    return table.concat(result)
+end
+
+function BuiltInBase64.decode(data)
+    validateSharePayload(data)
+    if #data % 4 ~= 0 then return nil, "Invalid Base64 length" end
+    local lookup = {}
+    for i = 1, #B64_CHARS do lookup[B64_CHARS:sub(i,i)] = i - 1 end
+    if data:find("[^" .. B64_CHARS .. "=]") then return nil, "Invalid Base64 character" end
+    local padding = select(2, data:gsub("=", ""))
+    if padding > 2 or (padding > 0 and data:sub(-padding) ~= string.rep("=", padding)) then return nil, "Invalid Base64 padding" end
+    local bytes = {}
+    for i = 1, #data, 4 do
+        local c1 = lookup[data:sub(i,i)]
+        local c2 = lookup[data:sub(i+1,i+1)]
+        local c3 = lookup[data:sub(i+2,i+2)]
+        local c4 = lookup[data:sub(i+3,i+3)]
+        if not c1 or not c2 then return nil, "Invalid Base64 quartet" end
+        if data:sub(i+2,i+2) == "=" and data:sub(i+3,i+3) ~= "=" then return nil, "Invalid Base64 padding" end
+        local n = (c1 * 262144) + (c2 * 4096) + ((c3 or 0) * 64) + (c4 or 0)
+        table.insert(bytes, string.char(math.floor(n / 65536) % 256))
+        if data:sub(i+2,i+2) ~= "=" then table.insert(bytes, string.char(math.floor(n / 256) % 256)) end
+        if data:sub(i+3,i+3) ~= "=" then table.insert(bytes, string.char(n % 256)) end
+    end
+    return table.concat(bytes)
+end
+
+local Base64 = BuiltInBase64
+do
+    local module = script:FindFirstChild("HyperionBase64")
+    if module and module:IsA("ModuleScript") then
+        local ok, loaded = pcall(require, module)
+        if ok and type(loaded) == "table" and type(loaded.encode) == "function" and type(loaded.decode) == "function" then
+            Base64 = loaded
+        end
+    end
+end
+
+-- ============================================================================
+-- 5. LANGUAGE DEFINITIONS & KEYWORDS
+-- ============================================================================
+local EPL_KEYWORDS = {
+    ["set"]=true, ["print"]=true, ["calculate"]=true, ["wait"]=true,
+    ["if"]=true, ["then"]=true, ["else"]=true, ["end"]=true,
+    ["while"]=true, ["do"]=true, ["for"]=true, ["times"]=true,
+    ["function"]=true, ["return"]=true, ["and"]=true, ["or"]=true, ["not"]=true,
+    ["true"]=true, ["false"]=true, ["nil"]=true
+}
+
+local LUA_KEYWORDS = {
+    ["and"]=true, ["break"]=true, ["do"]=true, ["else"]=true, ["elseif"]=true,
+    ["end"]=true, ["false"]=true, ["for"]=true, ["function"]=true, ["goto"]=true,
+    ["if"]=true, ["in"]=true, ["local"]=true, ["nil"]=true, ["not"]=true,
+    ["or"]=true, ["repeat"]=true, ["return"]=true, ["then"]=true, ["true"]=true,
+    ["until"]=true, ["while"]=true
+}
+
+local PY_KEYWORDS = {
+    ["and"]=true, ["as"]=true, ["assert"]=true, ["break"]=true, ["class"]=true,
+    ["continue"]=true, ["def"]=true, ["del"]=true, ["elif"]=true, ["else"]=true,
+    ["except"]=true, ["finally"]=true, ["for"]=true, ["from"]=true, ["global"]=true,
+    ["if"]=true, ["import"]=true, ["in"]=true, ["is"]=true, ["lambda"]=true,
+    ["not"]=true, ["or"]=true, ["pass"]=true, ["raise"]=true, ["return"]=true,
+    ["try"]=true, ["while"]=true, ["with"]=true, ["yield"]=true,
+    ["True"]=true, ["False"]=true, ["None"]=true, ["print"]=true
+}
+
+-- ============================================================================
+-- 6. LEXER ENGINE (With Python NEWLINE, INDENT & DEDENT handling)
+-- ============================================================================
+local Lexer = {}
+
+local function createToken(kind, value, line, col)
+    return { kind = kind, value = value, line = line, col = col }
+end
+
+function Lexer.lex(src, lang)
+    if #src > CONFIG.MAX_SOURCE_BYTES then
+        error(string.format("[Hyperion Lexer] Source exceeds %d bytes limit", CONFIG.MAX_SOURCE_BYTES), 0)
+    end
+    
+    local tokens = {}
+    local len = #src
+    local i, line, col = 1, 1, 1
+    
+    local isPython = (lang == "Python")
+    local keywords = isPython and PY_KEYWORDS or (lang == "EPL" and EPL_KEYWORDS or LUA_KEYWORDS)
+    
+    local indentStack = { 0 }
+    local atLineStart = true
+    local lineIndentSpaces = 0
+
+    local function advance(c)
+        if c == "\n" then
+            line = line + 1
+            col = 1
+            atLineStart = true
+            lineIndentSpaces = 0
+        else
+            col = col + 1
+        end
+    end
+
+    while i <= len do
+        if #tokens >= CONFIG.MAX_TOKEN_COUNT then
+            error(string.format("[Hyperion Lexer] Token count limit exceeded (%d)", CONFIG.MAX_TOKEN_COUNT), 0)
+        end
+        
+        -- Handle Python Indentation at beginning of logical line
+        if isPython and atLineStart then
+            lineIndentSpaces = 0
+            while i <= len do
+                local c = src:sub(i, i)
+                if c == " " then
+                    lineIndentSpaces = lineIndentSpaces + 1
+                    advance(c); i = i + 1
+                elseif c == "\t" then
+                    lineIndentSpaces = lineIndentSpaces + 4
+                    advance(c); i = i + 1
+                else
+                    break
+                end
+            end
+            
+            -- Ignore empty lines or comment-only lines for indentation
+            local nextChar = src:sub(i, i)
+            if nextChar == "\n" or nextChar == "#" or i > len then
+                atLineStart = false
+            else
+                atLineStart = false
+                local currentIndent = indentStack[#indentStack]
+                if lineIndentSpaces > currentIndent then
+                    table.insert(indentStack, lineIndentSpaces)
+                    table.insert(tokens, createToken("INDENT", tostring(lineIndentSpaces), line, col))
+                elseif lineIndentSpaces < currentIndent then
+                    while #indentStack > 1 and indentStack[#indentStack] > lineIndentSpaces do
+                        table.remove(indentStack)
+                        table.insert(tokens, createToken("DEDENT", tostring(lineIndentSpaces), line, col))
+                    end
+                    if indentStack[#indentStack] ~= lineIndentSpaces then
+                        table.insert(tokens, createToken("ERROR", "Inconsistent indentation", line, col))
+                    end
+                end
+            end
+        end
+
+        if i > len then break end
+        local c = src:sub(i, i)
+
+        -- Newlines
+        if c == "\n" then
+            if isPython and #tokens > 0 and tokens[#tokens].kind ~= "NEWLINE" then
+                table.insert(tokens, createToken("NEWLINE", "\n", line, col))
+            end
+            advance(c)
+            i = i + 1
+
+        -- Whitespace
+        elseif c:match("%s") then
+            advance(c)
+            i = i + 1
+
+        -- Comments
+        elseif (not isPython and c == "-" and src:sub(i+1, i+1) == "-") or (isPython and c == "#") then
+            local sl, sc = line, col
+            local s = ""
+            while i <= len and src:sub(i, i) ~= "\n" do
+                local ch = src:sub(i, i)
+                s = s .. ch
+                advance(ch)
+                i = i + 1
+            end
+            table.insert(tokens, createToken("COMMENT", s, sl, sc))
+
+        -- Strings
+        elseif c == '"' or c == "'" then
+            local q = c
+            local sl, sc = line, col
+            local s = q
+            advance(q)
+            i = i + 1
+            local closed = false
+            while i <= len do
+                local ch = src:sub(i, i)
+                s = s .. ch
+                advance(ch)
+                i = i + 1
+                if ch == "\\" and i <= len then
+                    local esc = src:sub(i, i)
+                    s = s .. esc
+                    advance(esc)
+                    i = i + 1
+                elseif ch == q then
+                    closed = true
+                    break
+                elseif ch == "\n" then
+                    break
+                end
+            end
+            table.insert(tokens, createToken(closed and "STRING" or "ERROR", s, sl, sc))
+
+        -- Identifiers / Keywords / Boolean / Nil
+        elseif c:match("[%a_]") then
+            local sl, sc = line, col
+            local s = ""
+            while i <= len and src:sub(i, i):match("[%w_]") do
+                local ch = src:sub(i, i)
+                s = s .. ch
+                advance(ch)
+                i = i + 1
+            end
+            
+            local kind = "IDENT"
+            if s == "true" or s == "false" or s == "True" or s == "False" then
+                kind = "BOOL_LIT"
+            elseif s == "nil" or s == "None" then
+                kind = "NIL_LIT"
+            elseif keywords[s] then
+                kind = "KEYWORD"
+            end
+            table.insert(tokens, createToken(kind, s, sl, sc))
+
+        -- Numbers
+        elseif c:match("%d") then
+            local sl, sc = line, col
+            local s = ""
+            local dotSeen = false
+            while i <= len do
+                local ch = src:sub(i, i)
+                if ch:match("%d") then
+                    s = s .. ch
+                    advance(ch); i = i + 1
+                elseif ch == "." and not dotSeen and src:sub(i+1, i+1) ~= "." then
+                    dotSeen = true
+                    s = s .. ch
+                    advance(ch); i = i + 1
+                else
+                    break
+                end
+            end
+            table.insert(tokens, createToken("NUMBER", s, sl, sc))
+
+        -- Multi-character operators
+        elseif src:sub(i, i+1) == "==" or src:sub(i, i+1) == ">=" or src:sub(i, i+1) == "<=" or src:sub(i, i+1) == "~=" or src:sub(i, i+1) == "!=" or src:sub(i, i+1) == ".." then
+            local op = src:sub(i, i+1)
+            table.insert(tokens, createToken("OP", op, line, col))
+            advance(op:sub(1,1))
+            advance(op:sub(2,2))
+            i = i + 2
+
+        -- Single-character operators & punctuation
+        elseif ("+-*/%^=<>(),.:[]{};"):find(c, 1, true) then
+            table.insert(tokens, createToken("OP", c, line, col))
+            advance(c)
+            i = i + 1
+
+        else
+            table.insert(tokens, createToken("ERROR", c, line, col))
+            advance(c)
+            i = i + 1
+        end
+    end
+
+    -- Python EOF DEDENT unwind
+    if isPython then
+        while #indentStack > 1 do
+            table.remove(indentStack)
+            table.insert(tokens, createToken("DEDENT", "0", line, col))
+        end
+    end
+
+    table.insert(tokens, createToken("EOF", "", line, col))
+    return tokens
+end
+
+-- ============================================================================
+-- 7. PARSER & AST ENGINE (Language-Aware & Complete Function AST Support)
+-- ============================================================================
+local Parser = {}
+Parser.__index = Parser
+
+function Parser.new(tokens, lang)
+    return setmetatable({
+        tokens = tokens,
+        pos = 1,
+        lang = lang or "EPL",
+        nodeCount = 0,
+        diagnostics = {}
+    }, Parser)
+end
+
+function Parser:cur()
+    return self.tokens[self.pos] or self.tokens[#self.tokens]
+end
+
+function Parser:peek(offset)
+    return self.tokens[self.pos + (offset or 1)] or self.tokens[#self.tokens]
+end
+
+function Parser:take()
+    local t = self:cur()
+    self.pos = self.pos + 1
+    return t
+end
+
+function Parser:addDiag(code, severity, msg, line, col)
+    table.insert(self.diagnostics, {
+        code = code,
+        severity = severity,
+        stage = "Parser",
+        lang = self.lang,
+        message = msg,
+        line = line or self:cur().line,
+        col = col or self:cur().col
+    })
+end
+
+function Parser:match(val)
+    if self:cur().value == val then
+        return self:take()
+    end
+    return nil
+end
+
+function Parser:expect(val)
+    local cur = self:cur()
+    if cur.value ~= val then
+        self:addDiag("PARSE-EXP-001", "ERROR", string.format("Expected '%s', got '%s'", val, cur.value), cur.line, cur.col)
+        return createToken("ERROR", val, cur.line, cur.col)
+    end
+    return self:take()
+end
+
+local OPERATOR_PRECEDENCE = {
+    ["or"] = 1,
+    ["and"] = 2,
+    ["=="] = 3, ["~="] = 3, ["!="] = 3,
+    ["<"] = 4, [">"] = 4, ["<="] = 4, [">="] = 4,
+    [".."] = 5,
+    ["+"] = 6, ["-"] = 6,
+    ["*"] = 7, ["/"] = 7, ["%"] = 7,
+    ["^"] = 8
+}
+
+function Parser:primary(depth)
+    depth = depth or 0
+    if depth > CONFIG.MAX_EXPRESSION_DEPTH then
+        self:addDiag("PARSE-DEP-002", "ERROR", "Max expression nesting depth exceeded", self:cur().line, self:cur().col)
+        return { tag = "number", value = 0, line = self:cur().line, col = self:cur().col }
+    end
+    
+    self.nodeCount = self.nodeCount + 1
+    if self.nodeCount > CONFIG.MAX_AST_NODES then
+        error("[Hyperion Parser] Maximum AST node limit exceeded (" .. CONFIG.MAX_AST_NODES .. ")", 0)
+    end
+    
+    local cur = self:cur()
+    
+    -- Number literal
+    if cur.kind == "NUMBER" then
+        self:take()
+        return { tag = "number", value = tonumber(cur.value) or 0, line = cur.line, col = cur.col }
+        
+    -- String literal
+    elseif cur.kind == "STRING" then
+        self:take()
+        local raw = cur.value
+        local clean = (raw:sub(1,1) == '"' or raw:sub(1,1) == "'") and raw:sub(2, -2) or raw
+        return { tag = "string", value = clean, line = cur.line, col = cur.col }
+
+    -- Boolean literal (true / false)
+    elseif cur.kind == "BOOL_LIT" then
+        self:take()
+        local isTrue = (cur.value == "true" or cur.value == "True")
+        return { tag = "bool", value = isTrue, line = cur.line, col = cur.col }
+
+    -- Nil literal (nil / None)
+    elseif cur.kind == "NIL_LIT" then
+        self:take()
+        return { tag = "nil", value = nil, line = cur.line, col = cur.col }
+        
+    -- Identifier / Function Call / Member Access
+    elseif cur.kind == "IDENT" then
+        self:take()
+        local node = { tag = "ident", name = cur.value, line = cur.line, col = cur.col }
+        
+        while true do
+            if self:match("(") then
+                local args = {}
+                if self:cur().value ~= ")" then
+                    table.insert(args, self:expr(0, depth + 1))
+                    while self:match(",") do
+                        table.insert(args, self:expr(0, depth + 1))
+                    end
+                end
+                self:expect(")")
+                node = { tag = "call", callee = node, args = args, line = cur.line, col = cur.col }
+            elseif self:match(".") then
+                local member = self:cur()
+                if member.kind == "IDENT" then
+                    self:take()
+                    node = { tag = "member", object = node, member = member.value, line = member.line, col = member.col }
+                else
+                    self:addDiag("PARSE-MEM-003", "ERROR", "Expected identifier after '.'", member.line, member.col)
+                    break
+                end
+            else
+                break
+            end
+        end
+        return node
+        
+    -- Parenthesized expression
+    elseif self:match("(") then
+        local inner = self:expr(0, depth + 1)
+        self:expect(")")
+        return inner
+        
+    -- Unary operators (-x, not x)
+    elseif cur.value == "-" or cur.value == "not" or cur.value == "!" then
+        local op = self:take().value
+        local operand = self:primary(depth + 1)
+        return { tag = "unary", op = op, operand = operand, line = cur.line, col = cur.col }
+    end
+    
+    self:addDiag("PARSE-EXP-004", "ERROR", "Expected valid expression, got '" .. cur.value .. "'", cur.line, cur.col)
+    self:take()
+    return { tag = "ident", name = "<error>", line = cur.line, col = cur.col }
+end
+
+function Parser:expr(minPrec, depth)
+    minPrec = minPrec or 0
+    depth = depth or 0
+    local left = self:primary(depth)
+    
+    while true do
+        local cur = self:cur()
+        local op = cur.value
+        local prec = OPERATOR_PRECEDENCE[op]
+        if not prec or prec < minPrec then break end
+        
+        self:take()
+        local nextMin = (op == "^") and prec or (prec + 1)
+        local right = self:expr(nextMin, depth + 1)
+        left = { tag = "binary", op = op, left = left, right = right, line = cur.line, col = cur.col }
+    end
+    return left
+end
+
+-- Statement Parsing with support for EPL, Lua, and Python
+function Parser:parseStatement()
+    local cur = self:cur()
+
+    -- Skip stray Python NEWLINEs between statements
+    while cur.kind == "NEWLINE" do
+        self:take()
+        cur = self:cur()
+    end
+    if cur.kind == "EOF" or cur.kind == "DEDENT" then return nil end
+
+    -- Comments
+    if cur.kind == "COMMENT" then
+        self:take()
+        return { tag = "comment", value = cur.value, line = cur.line, col = cur.col }
+    end
+
+    -- Lua/Luau "local function <name>(...)"
+    if cur.value == "local" and self:peek(1).value == "function" then
+        self:take(); self:take()
+        local fnName = self:cur().value
+        self:take()
+        self:expect("(")
+        local params = {}
+        if self:cur().value ~= ")" then
+            table.insert(params, self:cur().value)
+            self:take()
+            while self:match(",") do
+                table.insert(params, self:cur().value)
+                self:take()
+            end
+        end
+        self:expect(")")
+        local body = {}
+        while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
+            local s = self:parseStatement()
+            if s then table.insert(body, s) else break end
+        end
+        self:expect("end")
+        return { tag = "function", name = fnName, params = params, body = body, isLocal = true, line = cur.line, col = cur.col }
+    end
+
+    -- Python "def <name>(...):"
+    if cur.value == "def" then
+        self:take()
+        local fnName = self:cur().value
+        self:take()
+        self:expect("(")
+        local params = {}
+        if self:cur().value ~= ")" then
+            table.insert(params, self:cur().value)
+            self:take()
+            while self:match(",") do
+                table.insert(params, self:cur().value)
+                self:take()
+            end
+        end
+        self:expect(")")
+        self:expect(":")
+        while self:cur().kind == "NEWLINE" do self:take() end
+        self:expect("INDENT")
+        local body = {}
+        while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
+            local s = self:parseStatement()
+            if s then table.insert(body, s) else break end
+        end
+        self:match("DEDENT")
+        return { tag = "function", name = fnName, params = params, body = body, isLocal = false, line = cur.line, col = cur.col }
+    end
+
+    -- EPL / Lua variable declaration
+    if cur.value == "set" or cur.value == "local" then
+        self:take()
+        local id = self:cur()
+        if id.kind ~= "IDENT" then
+            self:addDiag("PARSE-SET-005", "ERROR", "Expected identifier after '" .. cur.value .. "'", id.line, id.col)
+            self:take()
+            return nil
+        end
+        self:take()
+        local val = { tag = "nil", value = nil }
+        if self:cur().value == "=" then
+            self:take()
+            val = self:expr(0)
+        end
+        return { tag = "set", name = id.value, expr = val, isLocal = (cur.value == "local"), line = cur.line, col = cur.col }
+    end
+
+    -- Print / Calculate statement
+    if cur.value == "print" or cur.value == "calculate" then
+        local isCalc = (cur.value == "calculate")
+        self:take()
+        local hasParen = self:match("(")
+        local e = self:expr(0)
+        if hasParen then self:expect(")") end
+        return { tag = isCalc and "calculate" or "print", expr = e, line = cur.line, col = cur.col }
+    end
+
+    -- Wait statement
+    if cur.value == "wait" or cur.value == "sleep" then
+        self:take()
+        local hasParen = self:match("(")
+        local e = self:expr(0)
+        if hasParen then self:expect(")") end
+        return { tag = "wait", expr = e, line = cur.line, col = cur.col }
+    end
+
+    -- While statement
+    if cur.value == "while" then
+        local whileToken = self:take()
+        local cond = self:expr(0)
+        local body = {}
+        if self.lang == "Python" then
+            self:expect(":")
+            while self:cur().kind == "NEWLINE" do self:take() end
+            self:expect("INDENT")
+            while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
+                local stmt = self:parseStatement()
+                if stmt then table.insert(body, stmt) else break end
+            end
+            self:match("DEDENT")
+        else
+            self:expect("do")
+            while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
+                local stmt = self:parseStatement()
+                if stmt then table.insert(body, stmt) else break end
+            end
+            self:expect("end")
+        end
+        return { tag = "while", cond = cond, body = body, line = whileToken.line, col = whileToken.col }
+    end
+
+    -- If statement
+    if cur.value == "if" then
+        self:take()
+        local cond = self:expr(0)
+        if self.lang == "Python" then
+            self:expect(":")
+            while self:cur().kind == "NEWLINE" do self:take() end
+            self:expect("INDENT")
+            local thenBody = {}
+            while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
+                local s = self:parseStatement()
+                if s then table.insert(thenBody, s) else break end
+            end
+            self:match("DEDENT")
+            local elseBody = {}
+            if self:match("else") then
+                self:expect(":")
+                while self:cur().kind == "NEWLINE" do self:take() end
+                self:expect("INDENT")
+                while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
+                    local s = self:parseStatement()
+                    if s then table.insert(elseBody, s) else break end
+                end
+                self:match("DEDENT")
+            end
+            return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = cur.line, col = cur.col }
+        else
+            self:expect("then")
+            local thenBody = {}
+            while self:cur().kind ~= "EOF" and self:cur().value ~= "else" and self:cur().value ~= "elseif" and self:cur().value ~= "end" do
+                local s = self:parseStatement()
+                if s then table.insert(thenBody, s) else break end
+            end
+            local elseBody = {}
+            if self:match("else") then
+                while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
+                    local s = self:parseStatement()
+                    if s then table.insert(elseBody, s) else break end
+                end
+            end
+            self:expect("end")
+            return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = cur.line, col = cur.col }
+        end
+    end
+
+    -- Return statement
+    if cur.value == "return" then
+        self:take()
+        local retExpr = nil
+        if self:cur().kind ~= "EOF" and self:cur().value ~= "end" and self:cur().kind ~= "NEWLINE" and self:cur().kind ~= "DEDENT" then
+            retExpr = self:expr(0)
+        end
+        return { tag = "return", expr = retExpr, line = cur.line, col = cur.col }
+    end
+
+    -- Assignment: <id> = <expr> OR Expression statement: func(...)
+    if cur.kind == "IDENT" then
+        if self:peek(1).value == "=" then
+            local id = self:take().value
+            self:take() -- eat '='
+            local val = self:expr(0)
+            return { tag = "set", name = id, expr = val, isLocal = false, line = cur.line, col = cur.col }
+        else
+            local e = self:expr(0)
+            return { tag = "expr_stmt", expr = e, line = cur.line, col = cur.col }
+        end
+    end
+
+    self:addDiag("PARSE-UNK-006", "ERROR", "Unsupported syntax or unexpected token '" .. cur.value .. "'", cur.line, cur.col)
+    self:take()
+    return nil
+end
+
+function Parser:parse()
+    local ast = { tag = "program", body = {}, lang = self.lang, nodeCount = 0 }
+    
+    while self:cur().kind ~= "EOF" do
+        self.nodeCount = self.nodeCount + 1
+        if self.nodeCount > CONFIG.MAX_AST_NODES then
+            error("[Hyperion Parser] AST node limit exceeded (" .. CONFIG.MAX_AST_NODES .. ")", 0)
+        end
+        
+        local stmt = self:parseStatement()
+        if stmt then
+            table.insert(ast.body, stmt)
+        end
+    end
+    
+    ast.nodeCount = self.nodeCount
+    return ast, self.diagnostics
+end
+
+-- ============================================================================
+-- 8. SEMANTIC ANALYZER (Hierarchical Scopes & Symbol Tracking)
+-- ============================================================================
+local SemanticAnalyzer = {}
+
+function SemanticAnalyzer.analyze(ast)
+    local diagnostics = {}
+    local symbols = {}
+    
+    -- Scope stack: each frame has declared { name -> {line, col, used} }
+    local scopeStack = { {} }
+    
+    local function pushScope() table.insert(scopeStack, {}) end
+    local function popScope()
+        local cur = table.remove(scopeStack)
+        for name, info in pairs(cur) do
+            if not info.used and name:sub(1,1) ~= "_" then
+                table.insert(diagnostics, {
+                    code = "SEM-VAR-001",
+                    severity = "WARNING",
+                    stage = "Semantic",
+                    message = string.format("Variable '%s' is declared but never read", name),
+                    line = info.line,
+                    col = info.col
+                })
+            end
+        end
+    end
+    
+    local function declareVar(name, kind, line, col)
+        local cur = scopeStack[#scopeStack]
+        cur[name] = { line = line, col = col, used = false }
+        table.insert(symbols, { name = name, kind = kind, line = line, col = col })
+    end
+    
+    local function useVar(name, line, col)
+        if name == "true" or name == "false" or name == "nil" or name == "<error>" then return end
+        for idx = #scopeStack, 1, -1 do
+            if scopeStack[idx][name] then
+                scopeStack[idx][name].used = true
+                return
+            end
+        end
+        -- Whitelist of global safe symbols
+        if not _G[name] and name ~= "math" and name ~= "string" and name ~= "table" and name ~= "task" and name ~= "game" and name ~= "workspace" and name ~= "script" and name ~= "tostring" and name ~= "tonumber" and name ~= "type" and name ~= "print" then
+            table.insert(diagnostics, {
+                code = "SEM-UND-002",
+                severity = "ERROR",
+                stage = "Semantic",
+                message = string.format("Undefined variable '%s'", name),
+                line = line,
+                col = col
+            })
+        end
+    end
+
+    local function checkExpr(n)
+        if not n then return end
+        if n.tag == "ident" then
+            useVar(n.name, n.line or 1, n.col or 1)
+        elseif n.tag == "binary" then
+            checkExpr(n.left)
+            checkExpr(n.right)
+            if (n.left.tag == "number" or n.left.tag == "string") and (n.right.tag == "number" or n.right.tag == "string") then
+                table.insert(diagnostics, {
+                    code = "SEM-OPT-003",
+                    severity = "INFO",
+                    stage = "Semantic",
+                    message = "Expression can be simplified by constant folding",
+                    line = n.line or 1,
+                    col = n.col or 1
+                })
+            end
+        elseif n.tag == "unary" then
+            checkExpr(n.operand)
+        elseif n.tag == "call" then
+            checkExpr(n.callee)
+            for _, arg in ipairs(n.args or {}) do checkExpr(arg) end
+        elseif n.tag == "member" then
+            checkExpr(n.object)
+        end
+    end
+
+    local function checkStatements(stmts)
+        local hasReturned = false
+        for _, stmt in ipairs(stmts) do
+            if hasReturned and stmt.tag ~= "comment" then
+                table.insert(diagnostics, {
+                    code = "SEM-RCH-004",
+                    severity = "WARNING",
+                    stage = "Semantic",
+                    message = "Unreachable code detected after return statement",
+                    line = stmt.line or 1,
+                    col = stmt.col or 1
+                })
+            end
+            
+            if stmt.tag == "set" then
+                declareVar(stmt.name, "variable", stmt.line, stmt.col)
+                checkExpr(stmt.expr)
+            elseif stmt.tag == "function" then
+                declareVar(stmt.name, "function", stmt.line, stmt.col)
+                pushScope()
+                for _, param in ipairs(stmt.params or {}) do
+                    declareVar(param, "parameter", stmt.line, stmt.col)
+                end
+                checkStatements(stmt.body or {})
+                popScope()
+            elseif stmt.tag == "print" or stmt.tag == "calculate" or stmt.tag == "wait" then
+                checkExpr(stmt.expr)
+            elseif stmt.tag == "expr_stmt" then
+                checkExpr(stmt.expr)
+            elseif stmt.tag == "if" then
+                checkExpr(stmt.cond)
+                pushScope(); checkStatements(stmt.thenBody or {}); popScope()
+                pushScope(); checkStatements(stmt.elseBody or {}); popScope()
+            elseif stmt.tag == "while" then
+                checkExpr(stmt.cond)
+                if stmt.cond and stmt.cond.tag == "bool" and stmt.cond.value == true then
+                    table.insert(diagnostics, {
+                        code = "SEM-LUP-005",
+                        severity = "WARNING",
+                        stage = "Semantic",
+                        message = "Possible infinite loop: 'while true' without sleep/yield safeguard",
+                        line = stmt.line or 1,
+                        col = stmt.col or 1
+                    })
+                end
+                pushScope(); checkStatements(stmt.body or {}); popScope()
+            elseif stmt.tag == "return" then
+                hasReturned = true
+                checkExpr(stmt.expr)
+            end
+        end
+    end
+
+    checkStatements(ast.body or {})
+    popScope()
+    
+    return diagnostics, symbols
+end
+
+-- ============================================================================
+-- 9. HYPERION IR (Source-Mapped Pseudo-Bytecode & Full Instruction Set)
+-- ============================================================================
+local validateIR
+local HyperionIR = {}
+
+function HyperionIR.fromAST(ast)
+    local instructions = {}
+    local constants = {}
+    local constLookup = {}
+    local regCounter = 0
+    
+    local function allocReg()
+        if regCounter >= CONFIG.MAX_REGISTERS then
+            error(string.format("[Hyperion IR] Register limit exceeded (%d)", CONFIG.MAX_REGISTERS), 0)
+        end
+        local r = "R" .. tostring(regCounter)
+        regCounter = regCounter + 1
+        return r
+    end
+    
+    local function addConst(val)
+        local key = type(val) .. ":" .. tostring(val)
+        if not constLookup[key] then
+            table.insert(constants, val)
+            constLookup[key] = #constants - 1
+        end
+        if #constants > CONFIG.MAX_CONSTANTS then
+            error(string.format("[Hyperion IR] Constant limit exceeded (%d)", CONFIG.MAX_CONSTANTS), 0)
+        end
+        return constLookup[key]
+    end
+    
+    local function emit(op, a, b, c, loc)
+        if #instructions >= CONFIG.MAX_IR_INSTRUCTIONS then
+            error(string.format("[Hyperion IR] Instruction limit exceeded (%d)", CONFIG.MAX_IR_INSTRUCTIONS), 0)
+        end
+        table.insert(instructions, {
+            idx = #instructions,
+            op = op,
+            a = a,
+            b = b,
+            c = c,
+            line = loc and loc.line or 1,
+            col = loc and loc.col or 1
+        })
+        return #instructions - 1
+    end
+    
+    local function compileExpr(node)
+        if not node then
+            local r = allocReg()
+            emit("LOADNIL", r, nil, nil, node)
+            return r
+        end
+        
+        if node.tag == "number" or node.tag == "string" then
+            local r = allocReg()
+            local kidx = addConst(node.value)
+            emit("LOADK", r, tostring(node.value), "K" .. kidx, node)
+            return r
+        elseif node.tag == "bool" then
+            local r = allocReg()
+            emit("LOADBOOL", r, tostring(node.value), nil, node)
+            return r
+        elseif node.tag == "nil" then
+            local r = allocReg()
+            emit("LOADNIL", r, nil, nil, node)
+            return r
+        elseif node.tag == "ident" then
+            local r = allocReg()
+            emit("LOAD", r, node.name, nil, node)
+            return r
+        elseif node.tag == "member" then
+            local rObj = compileExpr(node.object)
+            local rDst = allocReg()
+            emit("MEMBER", rDst, rObj, node.member, node)
+            return rDst
+        elseif node.tag == "binary" then
+            local rA = compileExpr(node.left)
+            local rDst = allocReg()
+            if node.op == "and" then
+                emit("MOVE", rDst, rA, nil, node)
+                local skipRight = emit("JMPNOT", rA, -1, nil, node)
+                local rB = compileExpr(node.right)
+                emit("MOVE", rDst, rB, nil, node)
+                instructions[skipRight + 1].b = #instructions
+                return rDst
+            elseif node.op == "or" then
+                emit("MOVE", rDst, rA, nil, node)
+                local skipRight = emit("JMPIF", rA, -1, nil, node)
+                local rB = compileExpr(node.right)
+                emit("MOVE", rDst, rB, nil, node)
+                instructions[skipRight + 1].b = #instructions
+                return rDst
+            end
+            local rB = compileExpr(node.right)
+            local opMap = {
+                ["+"] = "ADD", ["-"] = "SUB", ["*"] = "MUL", ["/"] = "DIV",
+                ["%"] = "MOD", ["^"] = "POW", ["=="] = "EQ", ["<"] = "LT",
+                [">"] = "GT", ["<="] = "LE", [">="] = "GE", ["~="] = "NEQ",
+                ["!="] = "NEQ", [".."] = "CONCAT"
+            }
+            local irOp = opMap[node.op]
+            if not irOp then error("Unsupported binary operator in IR: " .. tostring(node.op), 0) end
+            emit(irOp, rDst, rA, rB, node)
+            return rDst
+        elseif node.tag == "unary" then
+            local rSub = compileExpr(node.operand)
+            local rDst = allocReg()
+            if node.op == "not" or node.op == "!" then
+                emit("NOT", rDst, rSub, nil, node)
+            else
+                emit("UNM", rDst, rSub, nil, node)
+            end
+            return rDst
+        elseif node.tag == "call" then
+            local rDst = allocReg()
+            local argRegs = {}
+            for _, arg in ipairs(node.args or {}) do
+                table.insert(argRegs, compileExpr(arg))
+            end
+            local calleeName = node.callee.name or "func"
+            emit("CALL", rDst, calleeName, table.concat(argRegs, ","), node)
+            return rDst
+        end
+        
+        local fallback = allocReg()
+        emit("LOADNIL", fallback, nil, nil, node)
+        return fallback
+    end
+    
+    local function compileStatement(stmt)
+        if stmt.tag == "set" then
+            if stmt.isLocal then
+                emit("DECLARE_LOCAL", stmt.name, nil, nil, stmt)
+            end
+            local rVal = compileExpr(stmt.expr)
+            emit("STORE", stmt.name, rVal, nil, stmt)
+        elseif stmt.tag == "function" then
+            local jmpOver = emit("JMP", -1, nil, nil, stmt)
+            local fnStart = #instructions
+            for _, s in ipairs(stmt.body or {}) do compileStatement(s) end
+            emit("RETURN", "nil", nil, nil, stmt)
+            instructions[jmpOver + 1].a = #instructions
+            emit("DEF_FN", stmt.name, fnStart, table.concat(stmt.params or {}, ","), stmt)
+        elseif stmt.tag == "print" or stmt.tag == "calculate" then
+            local rVal = compileExpr(stmt.expr)
+            emit("PRINT", rVal, nil, nil, stmt)
+        elseif stmt.tag == "wait" then
+            local rSec = compileExpr(stmt.expr)
+            emit("WAIT", rSec, nil, nil, stmt)
+        elseif stmt.tag == "expr_stmt" then
+            compileExpr(stmt.expr)
+        elseif stmt.tag == "while" then
+            local loopStart = #instructions
+            local rCond = compileExpr(stmt.cond)
+            local exitJump = emit("JMPNOT", rCond, -1, nil, stmt)
+            for _, s in ipairs(stmt.body or {}) do compileStatement(s) end
+            emit("JMP", loopStart, nil, nil, stmt)
+            instructions[exitJump + 1].b = #instructions
+        elseif stmt.tag == "if" then
+            local rCond = compileExpr(stmt.cond)
+            local jmpIfIdx = emit("JMPNOT", rCond, -1, nil, stmt)
+            for _, s in ipairs(stmt.thenBody or {}) do compileStatement(s) end
+            
+            if stmt.elseBody and #stmt.elseBody > 0 then
+                local jmpElseEnd = emit("JMP", -1, nil, nil, stmt)
+                instructions[jmpIfIdx + 1].b = #instructions
+                for _, s in ipairs(stmt.elseBody) do compileStatement(s) end
+                instructions[jmpElseEnd + 1].a = #instructions
+            else
+                instructions[jmpIfIdx + 1].b = #instructions
+            end
+        elseif stmt.tag == "return" then
+            local rRet = stmt.expr and compileExpr(stmt.expr) or "nil"
+            emit("RETURN", rRet, nil, nil, stmt)
+        end
+    end
+    
+    for _, s in ipairs(ast.body or {}) do
+        compileStatement(s)
+    end
+    
+    emit("RETURN", "nil", nil, nil, { line = 1, col = 1 })
+    
+    return {
+        instructions = instructions,
+        constants = constants,
+        regCount = regCounter
+    }
+end
+
+function HyperionIR.disassemble(irData)
+    local lines = {
+        "; Hyperion IR v" .. CONFIG.VERSION .. " - Source Mapped Representation",
+        string.format("; Registers: %d | Constants: %d | Instructions: %d", irData.regCount, #irData.constants, #irData.instructions),
+        ""
+    }
+    
+    for _, inst in ipairs(irData.instructions) do
+        local opStr = string.format("%04d  %-8s %-6s", inst.idx, inst.op, tostring(inst.a or ""))
+        if inst.b then opStr = opStr .. " " .. tostring(inst.b) end
+        if inst.c then opStr = opStr .. " " .. tostring(inst.c) end
+        opStr = string.format("%-32s ; L%d:C%d", opStr, inst.line, inst.col)
+        table.insert(lines, opStr)
+    end
+    
+    return table.concat(lines, "\n")
+end
+
+-- ============================================================================
+-- 10. OPTIMIZER (Provably Safe Constant Folding & Algebraic Reductions)
+-- ============================================================================
+local Optimizer = {}
+
+function Optimizer.optimizeAST(node)
+    if not node or type(node) ~= "table" then return node end
+    
+    if node.tag == "program" then
+        local newBody = {}
+        for _, s in ipairs(node.body or {}) do
+            table.insert(newBody, Optimizer.optimizeAST(s))
+        end
+        node.body = newBody
+        return node
+    elseif node.tag == "binary" then
+        node.left = Optimizer.optimizeAST(node.left)
+        node.right = Optimizer.optimizeAST(node.right)
+        
+        -- Constant Folding: numbers
+        if node.left.tag == "number" and node.right.tag == "number" then
+            local a, b = node.left.value, node.right.value
+            if node.op == "+" then return { tag = "number", value = a + b, line = node.line, col = node.col }
+            elseif node.op == "-" then return { tag = "number", value = a - b, line = node.line, col = node.col }
+            elseif node.op == "*" then return { tag = "number", value = a * b, line = node.line, col = node.col }
+            elseif node.op == "/" and b ~= 0 then return { tag = "number", value = a / b, line = node.line, col = node.col }
+            elseif node.op == "%" and b ~= 0 then return { tag = "number", value = a % b, line = node.line, col = node.col }
+            elseif node.op == "^" then return { tag = "number", value = a ^ b, line = node.line, col = node.col }
+            end
+        end
+
+        -- Constant Folding: string concatenation
+        if node.op == ".." and node.left.tag == "string" and node.right.tag == "string" then
+            return { tag = "string", value = node.left.value .. node.right.value, line = node.line, col = node.col }
+        end
+        
+        -- Safe Algebraic Simplification (x + 0 => x, x * 1 => x) only for pure identifier/number
+        if node.op == "+" then
+            if node.right.tag == "number" and node.right.value == 0 then return node.left end
+            if node.left.tag == "number" and node.left.value == 0 then return node.right end
+        elseif node.op == "*" then
+            if node.right.tag == "number" and node.right.value == 1 then return node.left end
+            if node.left.tag == "number" and node.left.value == 1 then return node.right end
+        end
+        
+        return node
+    elseif node.tag == "set" or node.tag == "print" or node.tag == "calculate" or node.tag == "wait" then
+        node.expr = Optimizer.optimizeAST(node.expr)
+        return node
+    end
+    
+    return node
+end
+
+function Optimizer.optimizeIR(irData)
+    local validInput, inputError = validateIR(irData)
+    if not validInput then error("[Hyperion Optimizer] Refusing invalid IR: " .. tostring(inputError), 0) end
+    local beforeCount = #irData.instructions
+    local optimized = {}
+    for _, inst in ipairs(irData.instructions) do
+        table.insert(optimized, inst)
+    end
+    
+    for i, inst in ipairs(optimized) do
+        inst.idx = i - 1
+    end
+    
+    local afterCount = #optimized
+    local reduction = beforeCount > 0 and math.floor(((beforeCount - afterCount) / beforeCount) * 100) or 0
+    local validOutput, outputError = validateIR({
+        instructions = optimized,
+        constants = irData.constants,
+        regCount = irData.regCount
+    })
+    if not validOutput then error("[Hyperion Optimizer] Produced invalid IR: " .. tostring(outputError), 0) end
+    
+    return {
+        instructions = optimized,
+        constants = irData.constants,
+        regCount = irData.regCount,
+        stats = {
+            before = beforeCount,
+            after = afterCount,
+            reduction = reduction
+        }
+    }
+end
+
+-- ============================================================================
+-- 11. TARGET GENERATORS (Language-Specific Expressions & Operators)
+-- ============================================================================
+local TargetGen = {}
+
+local function emitExprLua(n)
+    if not n then return "nil" end
+    if n.tag == "number" then return tostring(n.value)
+    elseif n.tag == "string" then return string.format("%q", n.value)
+    elseif n.tag == "bool" then return tostring(n.value)
+    elseif n.tag == "nil" then return "nil"
+    elseif n.tag == "ident" then return n.name
+    elseif n.tag == "unary" then return "(" .. n.op .. " " .. emitExprLua(n.operand) .. ")"
+    elseif n.tag == "binary" then return "(" .. emitExprLua(n.left) .. " " .. n.op .. " " .. emitExprLua(n.right) .. ")"
+    elseif n.tag == "call" then
+        local args = {}
+        for _, a in ipairs(n.args or {}) do table.insert(args, emitExprLua(a)) end
+        return emitExprLua(n.callee) .. "(" .. table.concat(args, ", ") .. ")"
+    elseif n.tag == "member" then
+        return emitExprLua(n.object) .. "." .. n.member
+    end
+    return "nil"
+end
+
+local function emitExprPython(n)
+    if not n then return "None" end
+    if n.tag == "number" then return tostring(n.value)
+    elseif n.tag == "string" then return string.format("%q", n.value)
+    elseif n.tag == "bool" then return n.value and "True" or "False"
+    elseif n.tag == "nil" then return "None"
+    elseif n.tag == "ident" then return n.name
+    elseif n.tag == "unary" then
+        local op = (n.op == "~=" or n.op == "!") and "not" or n.op
+        return "(" .. op .. " " .. emitExprPython(n.operand) .. ")"
+    elseif n.tag == "binary" then
+        local op = n.op
+        if op == ".." then
+            return "(str(" .. emitExprPython(n.left) .. ") + str(" .. emitExprPython(n.right) .. "))"
+        elseif op == "~=" then
+            op = "!="
+        end
+        return "(" .. emitExprPython(n.left) .. " " .. op .. " " .. emitExprPython(n.right) .. ")"
+    elseif n.tag == "call" then
+        local args = {}
+        for _, a in ipairs(n.args or {}) do table.insert(args, emitExprPython(a)) end
+        return emitExprPython(n.callee) .. "(" .. table.concat(args, ", ") .. ")"
+    elseif n.tag == "member" then
+        return emitExprPython(n.object) .. "." .. n.member
+    end
+    return "None"
+end
+
+function TargetGen.toLuau(ast)
+    local lines = { "-- Target: Luau" }
+    local function emitStmts(stmts, indent)
+        indent = indent or ""
+        for _, stmt in ipairs(stmts) do
+            if stmt.tag == "comment" then table.insert(lines, indent .. stmt.value)
+            elseif stmt.tag == "set" then
+                local prefix = stmt.isLocal and "local " or ""
+                table.insert(lines, indent .. string.format("%s%s = %s", prefix, stmt.name, emitExprLua(stmt.expr)))
+            elseif stmt.tag == "while" then
+                table.insert(lines, indent .. "while " .. emitExprLua(stmt.cond) .. " do")
+                emitStmts(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "function" then
+                table.insert(lines, indent .. string.format("local function %s(%s)", stmt.name, table.concat(stmt.params or {}, ", ")))
+                emitStmts(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "print" then table.insert(lines, indent .. string.format("print(%s)", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "calculate" then table.insert(lines, indent .. string.format("print(%s)", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "wait" then table.insert(lines, indent .. string.format("task.wait(%s)", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "expr_stmt" then table.insert(lines, indent .. emitExprLua(stmt.expr))
+            elseif stmt.tag == "if" then
+                table.insert(lines, indent .. string.format("if %s then", emitExprLua(stmt.cond)))
+                emitStmts(stmt.thenBody or {}, indent .. "    ")
+                if stmt.elseBody and #stmt.elseBody > 0 then
+                    table.insert(lines, indent .. "else")
+                    emitStmts(stmt.elseBody, indent .. "    ")
+                end
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "return" then
+                table.insert(lines, indent .. (stmt.expr and ("return " .. emitExprLua(stmt.expr)) or "return"))
+            end
+        end
+    end
+    emitStmts(ast.body or {}, "")
+    return table.concat(lines, "\n")
+end
+
+function TargetGen.toPython(ast)
+    local lines = { "# Target: Python" }
+    local function emitStmts(stmts, indent)
+        indent = indent or ""
+        if #stmts == 0 then
+            table.insert(lines, indent .. "pass")
+            return
+        end
+        for _, stmt in ipairs(stmts) do
+            if stmt.tag == "comment" then table.insert(lines, indent .. "# " .. stmt.value:gsub("^%-%-", ""))
+            elseif stmt.tag == "set" then
+                table.insert(lines, indent .. string.format("%s = %s", stmt.name, emitExprPython(stmt.expr)))
+            elseif stmt.tag == "while" then
+                table.insert(lines, indent .. "while " .. emitExprPython(stmt.cond) .. ":")
+                emitStmts(stmt.body or {}, indent .. "    ")
+            elseif stmt.tag == "function" then
+                table.insert(lines, indent .. string.format("def %s(%s):", stmt.name, table.concat(stmt.params or {}, ", ")))
+                emitStmts(stmt.body or {}, indent .. "    ")
+            elseif stmt.tag == "print" or stmt.tag == "calculate" then
+                table.insert(lines, indent .. string.format("print(%s)", emitExprPython(stmt.expr)))
+            elseif stmt.tag == "wait" then
+                table.insert(lines, indent .. string.format("time.sleep(%s)", emitExprPython(stmt.expr)))
+            elseif stmt.tag == "expr_stmt" then
+                table.insert(lines, indent .. emitExprPython(stmt.expr))
+            elseif stmt.tag == "if" then
+                table.insert(lines, indent .. string.format("if %s:", emitExprPython(stmt.cond)))
+                emitStmts(stmt.thenBody or {}, indent .. "    ")
+                if stmt.elseBody and #stmt.elseBody > 0 then
+                    table.insert(lines, indent .. "else:")
+                    emitStmts(stmt.elseBody, indent .. "    ")
+                end
+            elseif stmt.tag == "return" then
+                table.insert(lines, indent .. (stmt.expr and ("return " .. emitExprPython(stmt.expr)) or "return"))
+            end
+        end
+    end
+    emitStmts(ast.body or {}, "")
+    return table.concat(lines, "\n")
+end
+
+function TargetGen.toEPL(ast)
+    local lines = { "-- Target: EPL" }
+    for _, stmt in ipairs(ast.body or {}) do
+        if stmt.tag == "comment" then table.insert(lines, stmt.value)
+        elseif stmt.tag == "set" then table.insert(lines, string.format("set %s = %s", stmt.name, emitExprLua(stmt.expr)))
+        elseif stmt.tag == "print" then table.insert(lines, string.format("print %s", emitExprLua(stmt.expr)))
+        elseif stmt.tag == "calculate" then table.insert(lines, string.format("calculate %s", emitExprLua(stmt.expr)))
+        elseif stmt.tag == "wait" then table.insert(lines, string.format("wait %s", emitExprLua(stmt.expr)))
+        elseif stmt.tag == "while" then
+            table.insert(lines, "while " .. emitExprLua(stmt.cond) .. " do")
+            for _, child in ipairs(stmt.body or {}) do
+                if child.tag == "print" then
+                    table.insert(lines, "    print " .. emitExprLua(child.expr))
+                elseif child.tag == "set" then
+                    table.insert(lines, "    set " .. child.name .. " = " .. emitExprLua(child.expr))
+                elseif child.tag == "wait" then
+                    table.insert(lines, "    wait " .. emitExprLua(child.expr))
+                end
+            end
+            table.insert(lines, "end")
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+-- ============================================================================
+-- 12. TRANSLATION MATRIX & CACHE
+-- ============================================================================
+local TranslationCache = {}
+local translationStats = { hits = 0, misses = 0 }
+
+local function translateSource(src, fromLang, toLang)
+    if fromLang == toLang then return src end
+    
+    local cacheKey = hashSource(src, fromLang, toLang)
+    if TranslationCache[cacheKey] then
+        translationStats.hits = translationStats.hits + 1
+        return TranslationCache[cacheKey]
+    end
+    translationStats.misses = translationStats.misses + 1
+    
+    local tokens = Lexer.lex(src, fromLang)
+    local parser = Parser.new(tokens, fromLang)
+    local ast, diags = parser:parse()
+    
+    for _, d in ipairs(diags) do
+        if d.severity == "ERROR" then
+            error(string.format("[Hyperion Translator] %s at Line %d, Col %d", d.message, d.line, d.col), 0)
+        end
+    end
+    
+    local optAST = Optimizer.optimizeAST(ast)
+    local result = ""
+    
+    if toLang == "IR" then
+        local irData = HyperionIR.fromAST(optAST)
+        local optIR = Optimizer.optimizeIR(irData)
+        result = HyperionIR.disassemble(optIR)
+    elseif toLang == "Luau" or toLang == "Lua" then
+        result = TargetGen.toLuau(optAST)
+    elseif toLang == "Python" then
+        result = TargetGen.toPython(optAST)
+    elseif toLang == "EPL" then
+        result = TargetGen.toEPL(optAST)
+    else
+        error("Unsupported target translation language: " .. tostring(toLang), 0)
+    end
+    
+    TranslationCache[cacheKey] = result
+    return result
+end
+
+-- ============================================================================
+-- 13. HARDENED SANDBOXED VM (Call Frames, Scopes, Strict Watchdog)
+-- ============================================================================
+local VM = {
+    state = "IDLE", -- "IDLE", "RUNNING", "PAUSED", "HALTED"
+    pc = 1,
+    registers = {},
+    environment = {},
+    callStack = {},
+    functions = {},
+    breakpoints = {},
+    instructions = {},
+    constants = {},
+    outputBytes = 0,
+    instructionsExecuted = 0,
+    startTime = 0,
+    deadline = 0,
+    onOutput = nil,
+    onHalt = nil,
+    onPause = nil,
+    lastError = nil
+}
+
+local VALID_OPCODES = {
+    LOADK=true, LOADBOOL=true, LOADNIL=true, MOVE=true, DECLARE_LOCAL=true,
+    LOAD=true, STORE=true, ADD=true, SUB=true, MUL=true, DIV=true, MOD=true,
+    POW=true, EQ=true, NEQ=true, LT=true, LE=true, GT=true, GE=true,
+    AND=true, OR=true, NOT=true, UNM=true, CONCAT=true, MEMBER=true,
+    DEF_FN=true, CALL=true, RETURN=true, PRINT=true, WAIT=true,
+    JMP=true, JMPIF=true, JMPNOT=true
+}
+
+validateIR = function(irData)
+    if type(irData) ~= "table" or type(irData.instructions) ~= "table" then
+        return false, "IR is missing its instruction array"
+    end
+    if type(irData.regCount) ~= "number" or irData.regCount < 0 or irData.regCount % 1 ~= 0 or irData.regCount > CONFIG.MAX_REGISTERS then
+        return false, "IR register count is invalid"
+    end
+    if type(irData.constants) ~= "table" or #irData.constants > CONFIG.MAX_CONSTANTS then
+        return false, "IR constant table is invalid or too large"
+    end
+    local count = #irData.instructions
+    if count == 0 then
+        return false, "IR contains no instructions"
+    end
+    if count > CONFIG.MAX_IR_INSTRUCTIONS then
+        return false, string.format("IR contains %d instructions; maximum is %d", count, CONFIG.MAX_IR_INSTRUCTIONS)
+    end
+    if type(irData.regCount) == "number" and (irData.regCount < 0 or irData.regCount > CONFIG.MAX_REGISTERS) then
+        return false, string.format("IR register count is outside the safe range: %s", tostring(irData.regCount))
+    end
+    for i, inst in ipairs(irData.instructions) do
+        if type(inst) ~= "table" or type(inst.op) ~= "string" or not VALID_OPCODES[inst.op] then
+            return false, string.format("Invalid opcode at instruction %d", i)
+        end
+        if inst.idx ~= nil and (type(inst.idx) ~= "number" or inst.idx ~= i - 1) then
+            return false, string.format("Invalid instruction index at instruction %d", i)
+        end
+        if inst.line ~= nil and type(inst.line) ~= "number" then
+            return false, string.format("Invalid source line at instruction %d", i)
+        end
+        local function validReg(value)
+            if type(value) ~= "string" then return false end
+            local n = tonumber(value:match("^R(%d+)$"))
+            return n ~= nil and n % 1 == 0 and n >= 0 and n < irData.regCount
+        end
+        local function requireReg(value, label)
+            if not validReg(value) then
+                return false, string.format("Invalid %s register at instruction %d", label, i)
+            end
+            return true
+        end
+        local regError
+        if inst.op == "LOADK" or inst.op == "LOADBOOL" or inst.op == "LOADNIL" or inst.op == "PRINT" or inst.op == "WAIT" or inst.op == "DECLARE_LOCAL" then
+            if inst.op ~= "DECLARE_LOCAL" then
+                local okReg, msg = requireReg(inst.a, "destination")
+                if not okReg then return false, msg end
+            elseif type(inst.a) ~= "string" or inst.a == "" then
+                return false, string.format("Invalid local name at instruction %d", i)
+            end
+        elseif inst.op == "MOVE" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            local okB, msgB = requireReg(inst.b, "source"); if not okB then return false, msgB end
+        elseif inst.op == "LOAD" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            if type(inst.b) ~= "string" or inst.b == "" then return false, string.format("Invalid load name at instruction %d", i) end
+        elseif inst.op == "STORE" then
+            if type(inst.a) ~= "string" or inst.a == "" then return false, string.format("Invalid store name at instruction %d", i) end
+            local okB, msgB = requireReg(inst.b, "source"); if not okB then return false, msgB end
+        elseif inst.op == "ADD" or inst.op == "SUB" or inst.op == "MUL" or inst.op == "DIV" or inst.op == "MOD" or inst.op == "POW" or inst.op == "EQ" or inst.op == "NEQ" or inst.op == "LT" or inst.op == "LE" or inst.op == "GT" or inst.op == "GE" or inst.op == "AND" or inst.op == "OR" or inst.op == "CONCAT" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            local okB, msgB = requireReg(inst.b, "left/source"); if not okB then return false, msgB end
+            local okC, msgC = requireReg(inst.c, "right/source"); if not okC then return false, msgC end
+        elseif inst.op == "NOT" or inst.op == "UNM" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            local okB, msgB = requireReg(inst.b, "source"); if not okB then return false, msgB end
+        elseif inst.op == "MEMBER" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            local okB, msgB = requireReg(inst.b, "object"); if not okB then return false, msgB end
+            if type(inst.c) ~= "string" or inst.c == "" then return false, string.format("Invalid member name at instruction %d", i) end
+        elseif inst.op == "CALL" then
+            local okA, msgA = requireReg(inst.a, "destination"); if not okA then return false, msgA end
+            if type(inst.b) ~= "string" or inst.b == "" then return false, string.format("Invalid call target at instruction %d", i) end
+            if inst.c then
+                for arg in inst.c:gmatch("[^,]+") do
+                    local okArg, msgArg = requireReg(arg, "argument")
+                    if not okArg then return false, msgArg end
+                end
+            end
+        elseif inst.op == "RETURN" then
+            if inst.a ~= nil and inst.a ~= "nil" then
+                local okA, msgA = requireReg(inst.a, "return"); if not okA then return false, msgA end
+            end
+        elseif inst.op == "JMPIF" or inst.op == "JMPNOT" then
+            local okA, msgA = requireReg(inst.a, "condition"); if not okA then return false, msgA end
+        end
+        if inst.op == "JMP" then
+            local target = tonumber(inst.a)
+            if not target or target % 1 ~= 0 or target < 0 or target >= count then
+                return false, string.format("Invalid JMP target at instruction %d", i)
+            end
+        elseif inst.op == "JMPIF" or inst.op == "JMPNOT" then
+            local target = tonumber(inst.b)
+            if not target or target % 1 ~= 0 or target < 0 or target >= count then
+                return false, string.format("Invalid conditional jump target at instruction %d", i)
+            end
+        elseif inst.op == "DEF_FN" then
+            local target = tonumber(inst.b)
+            if not target or target % 1 ~= 0 or target < 0 or target >= count then
+                return false, string.format("Invalid function entry at instruction %d", i)
+            end
+        elseif inst.op == "LOADK" and type(inst.c) == "string" and inst.c:sub(1, 1) == "K" then
+            local k = tonumber(inst.c:sub(2))
+            if not k or k % 1 ~= 0 or k < 0 or not irData.constants or irData.constants[k + 1] == nil then
+                return false, string.format("Invalid constant reference at instruction %d", i)
+            end
+        elseif inst.op == "CALL" and inst.c ~= nil and type(inst.c) ~= "string" then
+            return false, string.format("Invalid CALL argument encoding at instruction %d", i)
+        end
+    end
+    return true
+end
+
+function VM.init(irData, customEnv)
+    local valid, validationError = validateIR(irData)
+    if not valid then
+        error("[Hyperion IR] " .. validationError, 0)
+    end
+    VM.lastError = nil
+    VM.instructions = irData.instructions
+    VM.constants = irData.constants or {}
+    VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
+    VM.pc = 1
+    VM.registers = {}
+    VM.callStack = {}
+    VM.functions = {}
+    VM.breakpoints = {}
+    VM.outputBytes = 0
+    VM.instructionsExecuted = 0
+    VM.state = "IDLE"
+    
+    -- Sandboxed Safe Environment
+    VM.environment = {
+        math = math,
+        string = string,
+        table = table,
+        task = { wait = task.wait },
+        tostring = tostring,
+        tonumber = tonumber,
+        type = type,
+        print = function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do table.insert(parts, tostring(select(i, ...))) end
+            local outStr = table.concat(parts, "\t")
+            VM.outputBytes = VM.outputBytes + #outStr
+            if VM.outputBytes > CONFIG.MAX_OUTPUT_BYTES then
+                VM.state = "HALTED"
+                error("[Hyperion VM] Execution stopped: maximum output size (10 KB) exceeded.", 0)
+            end
+            if VM.onOutput then VM.onOutput(outStr) end
+        end
+    }
+    
+    if customEnv then
+        for k, v in pairs(customEnv) do VM.environment[k] = v end
+    end
+end
+
+local function isTruthy(value)
+    return value ~= nil and value ~= false
+end
+
+local function getScopedValue(frame, name)
+    local depth = 0
+    local cursor = frame
+    while cursor do
+        depth = depth + 1
+        if depth > CONFIG.MAX_CLOSURE_DEPTH then
+            error("[Hyperion VM] Closure scope depth exceeded", 0)
+        end
+        if cursor.declaredLocals[name] then
+            return cursor.locals[name]
+        end
+        cursor = cursor.parent
+    end
+    return VM.environment[name]
+end
+
+local function setScopedValue(frame, name, value)
+    local depth = 0
+    local cursor = frame
+    while cursor do
+        depth = depth + 1
+        if depth > CONFIG.MAX_CLOSURE_DEPTH then
+            error("[Hyperion VM] Closure scope depth exceeded", 0)
+        end
+        if cursor.declaredLocals[name] then
+            cursor.locals[name] = value
+            return
+        end
+        cursor = cursor.parent
+    end
+    VM.environment[name] = value
+end
+
+local function expectComparable(a, b, operation, inst)
+    local ta, tb = type(a), type(b)
+    if (ta ~= "number" and ta ~= "string") or (tb ~= "number" and tb ~= "string") then
+        VM.state = "HALTED"
+        error(string.format("Runtime error at L%d:C%d: %s requires matching number or string operands, got %s and %s",
+            inst.line or 1, inst.col or 1, operation, ta, tb), 0)
+    end
+    return a, b
+end
+
+local function expectNumber(value, operation, inst, operandName)
+    if type(value) == "number" then return value end
+    if type(value) == "string" then
+        local converted = tonumber(value)
+        if converted ~= nil then return converted end
+    end
+    VM.state = "HALTED"
+    error(string.format("Runtime error at L%d:C%d: %s requires a numeric value for %s, got %s",
+        inst.line or 1, inst.col or 1, operation, operandName or "operand", type(value)), 0)
+end
+
+function VM.step()
+    if VM.state == "HALTED" or VM.state == "PAUSED" then
+        return false
+    end
+    if VM.pc < 1 then
+        VM.state = "HALTED"
+        error(string.format("VM ERROR: Program counter out of bounds (%s)", tostring(VM.pc)), 0)
+    elseif VM.pc > #VM.instructions then
+        VM.state = "HALTED"
+        if VM.onHalt then VM.onHalt("Execution finished") end
+        return false
+    end
+    
+    VM.instructionsExecuted = VM.instructionsExecuted + 1
+    
+    if VM.instructionsExecuted > CONFIG.MAX_INSTRUCTIONS then
+        VM.state = "HALTED"
+        error(string.format("[Hyperion Watchdog] Instruction budget exceeded (%d ops)", CONFIG.MAX_INSTRUCTIONS), 0)
+    end
+    if os.clock() > VM.deadline then
+        VM.state = "HALTED"
+        error(string.format("[Hyperion Watchdog] Runtime budget exceeded (%.2f s)", CONFIG.MAX_RUNTIME_SEC), 0)
+    end
+    
+    local inst = VM.instructions[VM.pc]
+    local op = inst.op
+    
+    -- Breakpoint check
+    if VM.breakpoints[inst.line] and VM.state == "RUNNING" and VM.instructionsExecuted > 1 then
+        VM.state = "PAUSED"
+        if VM.onPause then VM.onPause(inst.line, inst.idx) end
+        return false
+    end
+    
+    -- Execute Opcodes
+    if op == "LOADK" then
+        local value = inst.b
+        if type(inst.c) == "string" and inst.c:sub(1, 1) == "K" then
+            local k = tonumber(inst.c:sub(2))
+            if k ~= nil and VM.constants[k + 1] ~= nil then
+                value = VM.constants[k + 1]
+            end
+        end
+        VM.registers[inst.a] = value
+        VM.pc = VM.pc + 1
+    elseif op == "LOADBOOL" then
+        VM.registers[inst.a] = (inst.b == "true")
+        VM.pc = VM.pc + 1
+    elseif op == "LOADNIL" then
+        VM.registers[inst.a] = nil
+        VM.pc = VM.pc + 1
+    elseif op == "MOVE" then
+        VM.registers[inst.a] = VM.registers[inst.b]
+        VM.pc = VM.pc + 1
+    elseif op == "DECLARE_LOCAL" then
+        if #VM.callStack > 0 then
+            local frame = VM.callStack[#VM.callStack]
+            frame.declaredLocals[inst.a] = true
+            frame.locals[inst.a] = nil
+        end
+        VM.pc = VM.pc + 1
+    elseif op == "LOAD" then
+        local frame = #VM.callStack > 0 and VM.callStack[#VM.callStack] or nil
+        VM.registers[inst.a] = frame and getScopedValue(frame, inst.b) or VM.environment[inst.b]
+        VM.pc = VM.pc + 1
+    elseif op == "STORE" then
+        local val = VM.registers[inst.b]
+        local frame = #VM.callStack > 0 and VM.callStack[#VM.callStack] or nil
+        if frame then
+            setScopedValue(frame, inst.a, val)
+        else
+            VM.environment[inst.a] = val
+        end
+        VM.pc = VM.pc + 1
+    elseif op == "ADD" then
+        local a = expectNumber(VM.registers[inst.b], "ADD", inst, "left operand")
+        local b = expectNumber(VM.registers[inst.c], "ADD", inst, "right operand")
+        VM.registers[inst.a] = a + b
+        VM.pc = VM.pc + 1
+    elseif op == "SUB" then
+        local a = expectNumber(VM.registers[inst.b], "SUB", inst, "left operand")
+        local b = expectNumber(VM.registers[inst.c], "SUB", inst, "right operand")
+        VM.registers[inst.a] = a - b
+        VM.pc = VM.pc + 1
+    elseif op == "MUL" then
+        local a = expectNumber(VM.registers[inst.b], "MUL", inst, "left operand")
+        local b = expectNumber(VM.registers[inst.c], "MUL", inst, "right operand")
+        VM.registers[inst.a] = a * b
+        VM.pc = VM.pc + 1
+    elseif op == "DIV" then
+        local a = expectNumber(VM.registers[inst.b], "DIV", inst, "left operand")
+        local d = expectNumber(VM.registers[inst.c], "DIV", inst, "denominator")
+        if d == 0 then
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: Division by zero", inst.line or 1, inst.col or 1), 0)
+        end
+        VM.registers[inst.a] = a / d
+        VM.pc = VM.pc + 1
+    elseif op == "MOD" then
+        local a = expectNumber(VM.registers[inst.b], "MOD", inst, "left operand")
+        local d = expectNumber(VM.registers[inst.c], "MOD", inst, "denominator")
+        if d == 0 then
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: Modulo by zero", inst.line or 1, inst.col or 1), 0)
+        end
+        VM.registers[inst.a] = a % d
+        VM.pc = VM.pc + 1
+    elseif op == "POW" then
+        local a = expectNumber(VM.registers[inst.b], "POW", inst, "base")
+        local b = expectNumber(VM.registers[inst.c], "POW", inst, "exponent")
+        VM.registers[inst.a] = a ^ b
+        VM.pc = VM.pc + 1
+    elseif op == "EQ" then
+        VM.registers[inst.a] = (VM.registers[inst.b] == VM.registers[inst.c])
+        VM.pc = VM.pc + 1
+    elseif op == "NEQ" then
+        VM.registers[inst.a] = (VM.registers[inst.b] ~= VM.registers[inst.c])
+        VM.pc = VM.pc + 1
+    elseif op == "LT" then
+        local a, b = expectComparable(VM.registers[inst.b], VM.registers[inst.c], "LT", inst)
+        VM.registers[inst.a] = (a < b)
+        VM.pc = VM.pc + 1
+    elseif op == "LE" then
+        local a, b = expectComparable(VM.registers[inst.b], VM.registers[inst.c], "LE", inst)
+        VM.registers[inst.a] = (a <= b)
+        VM.pc = VM.pc + 1
+    elseif op == "GT" then
+        local a, b = expectComparable(VM.registers[inst.b], VM.registers[inst.c], "GT", inst)
+        VM.registers[inst.a] = (a > b)
+        VM.pc = VM.pc + 1
+    elseif op == "GE" then
+        local a, b = expectComparable(VM.registers[inst.b], VM.registers[inst.c], "GE", inst)
+        VM.registers[inst.a] = (a >= b)
+        VM.pc = VM.pc + 1
+    elseif op == "AND" then
+        VM.registers[inst.a] = VM.registers[inst.b] and VM.registers[inst.c]
+        VM.pc = VM.pc + 1
+    elseif op == "OR" then
+        VM.registers[inst.a] = VM.registers[inst.b] or VM.registers[inst.c]
+        VM.pc = VM.pc + 1
+    elseif op == "NOT" then
+        VM.registers[inst.a] = not VM.registers[inst.b]
+        VM.pc = VM.pc + 1
+    elseif op == "UNM" then
+        local value = expectNumber(VM.registers[inst.b], "UNM", inst, "operand")
+        VM.registers[inst.a] = -value
+        VM.pc = VM.pc + 1
+    elseif op == "CONCAT" then
+        local left, right = VM.registers[inst.b], VM.registers[inst.c]
+        local function concatValue(value, operandName)
+            local valueType = type(value)
+            if valueType == "string" or valueType == "number" then return tostring(value) end
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: CONCAT requires string or number for %s, got %s",
+                inst.line or 1, inst.col or 1, operandName, valueType), 0)
+        end
+        VM.registers[inst.a] = concatValue(left, "left operand") .. concatValue(right, "right operand")
+        VM.pc = VM.pc + 1
+    elseif op == "MEMBER" then
+        local obj = VM.registers[inst.b]
+        if type(inst.c) ~= "string" or inst.c == "" then
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: Invalid member name", inst.line or 1, inst.col or 1), 0)
+        end
+        if type(obj) == "table" then
+            VM.registers[inst.a] = obj[inst.c]
+        else
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: Cannot index %s with '%s'", inst.line, inst.col, type(obj), tostring(inst.c)), 0)
+        end
+        VM.pc = VM.pc + 1
+    elseif op == "DEF_FN" then
+        VM.functions[inst.a] = {
+            pc = tonumber(inst.b),
+            params = inst.c,
+            closure = #VM.callStack > 0 and VM.callStack[#VM.callStack] or nil
+        }
+        VM.pc = VM.pc + 1
+    elseif op == "CALL" then
+        local fnName = inst.b
+        local fnInfo = VM.functions[fnName]
+        if fnInfo then
+            if type(inst.c) ~= "string" and inst.c ~= nil then
+                VM.state = "HALTED"
+                error(string.format("Runtime error at L%d:C%d: Malformed CALL argument list", inst.line or 1, inst.col or 1), 0)
+            end
+            if #VM.callStack >= CONFIG.MAX_RECURSION_DEPTH then
+                VM.state = "HALTED"
+                error(string.format("Runtime error at L%d:C%d: Maximum recursion depth (%d) exceeded", inst.line, inst.col, CONFIG.MAX_RECURSION_DEPTH), 0)
+            end
+            local callerRegisters = VM.registers
+            local locals = {}
+            local declaredLocals = {}
+            local argNames = {}
+            if fnInfo.params then
+                for p in fnInfo.params:gmatch("[^,]+") do
+                    table.insert(argNames, p)
+                    declaredLocals[p] = true
+                end
+            end
+            local argVals = {}
+            if inst.c and inst.c ~= "" then
+                for a in inst.c:gmatch("[^,]+") do
+                    if #argVals >= CONFIG.MAX_CALL_ARGS then
+                        VM.state = "HALTED"
+                        error(string.format("Runtime error at L%d:C%d: Call argument limit (%d) exceeded",
+                            inst.line or 1, inst.col or 1, CONFIG.MAX_CALL_ARGS), 0)
+                    end
+                    table.insert(argVals, VM.registers[a])
+                end
+            end
+            if #argVals > #argNames then
+                VM.state = "HALTED"
+                error(string.format("Runtime error at L%d:C%d: Too many arguments for '%s' (expected %d, got %d)",
+                    inst.line or 1, inst.col or 1, fnName, #argNames, #argVals), 0)
+            end
+            for idx, name in ipairs(argNames) do
+                locals[name] = argVals[idx]
+            end
+            table.insert(VM.callStack, {
+                returnPC = VM.pc + 1,
+                returnReg = inst.a,
+                callerRegisters = callerRegisters,
+                locals = locals,
+                declaredLocals = declaredLocals,
+                parent = fnInfo.closure,
+                name = fnName
+            })
+            VM.registers = {}
+            VM.pc = fnInfo.pc + 1
+        elseif VM.environment[fnName] and type(VM.environment[fnName]) == "function" then
+            local args = {}
+            if inst.c and inst.c ~= "" then
+                for a in inst.c:gmatch("[^,]+") do
+                    if #args >= CONFIG.MAX_CALL_ARGS then
+                        VM.state = "HALTED"
+                        error(string.format("Runtime error at L%d:C%d: Call argument limit (%d) exceeded",
+                            inst.line or 1, inst.col or 1, CONFIG.MAX_CALL_ARGS), 0)
+                    end
+                    table.insert(args, VM.registers[a])
+                end
+            end
+            VM.registers[inst.a] = VM.environment[fnName](unpack(args))
+            VM.pc = VM.pc + 1
+        else
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: Attempt to call undefined function '%s'", inst.line, inst.col, tostring(fnName)), 0)
+        end
+    elseif op == "RETURN" then
+        local retVal = (inst.a and inst.a ~= "nil") and VM.registers[inst.a] or nil
+        if #VM.callStack > 0 then
+            local frame = table.remove(VM.callStack)
+            VM.registers = frame.callerRegisters
+            if frame.returnReg then VM.registers[frame.returnReg] = retVal end
+            VM.pc = frame.returnPC
+        else
+            VM.state = "HALTED"
+            if VM.onHalt then VM.onHalt("Finished") end
+            return false
+        end
+    elseif op == "PRINT" then
+        local val = VM.registers[inst.a]
+        VM.environment.print(val)
+        VM.pc = VM.pc + 1
+    elseif op == "WAIT" then
+        local sec = expectNumber(VM.registers[inst.a], "WAIT", inst, "seconds")
+        if sec < 0 then
+            VM.state = "HALTED"
+            error(string.format("Runtime error at L%d:C%d: WAIT requires non-negative seconds", inst.line or 1, inst.col or 1), 0)
+        end
+        local remaining = VM.deadline - os.clock()
+        if remaining <= 0 then
+            VM.state = "HALTED"
+            error("[Hyperion Watchdog] Runtime budget exceeded in wait", 0)
+        end
+        task.wait(math.clamp(sec, 0, math.min(1.0, remaining)))
+        VM.pc = VM.pc + 1
+    elseif op == "JMP" then
+        VM.pc = tonumber(inst.a) + 1
+    elseif op == "JMPIF" then
+        if isTruthy(VM.registers[inst.a]) then VM.pc = tonumber(inst.b) + 1 else VM.pc = VM.pc + 1 end
+    elseif op == "JMPNOT" then
+        if not isTruthy(VM.registers[inst.a]) then VM.pc = tonumber(inst.b) + 1 else VM.pc = VM.pc + 1 end
+    else
+        VM.state = "HALTED"
+        error(string.format("VM ERROR: Unsupported opcode '%s' at instruction %d", tostring(op), inst.idx), 0)
+    end
+    
+    return true
+end
+
+function VM.runContinuous()
+    VM.state = "RUNNING"
+    VM.startTime = os.clock()
+    VM.deadline = VM.startTime + CONFIG.MAX_RUNTIME_SEC
+    
+    while VM.state == "RUNNING" do
+        local ok, cont = pcall(VM.step)
+        if not ok then
+            VM.state = "HALTED"
+            VM.lastError = tostring(cont)
+            if VM.onOutput then VM.onOutput("[Error] " .. VM.lastError) end
+            break
+        end
+        if not cont then break end
+    end
+end
+
+-- ============================================================================
+-- 14. PROFILER & SELF-TEST SUITE
+-- ============================================================================
+local Profiler = {
+    timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 },
+    counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+}
+
+local TestRunner = {}
+
+function TestRunner.runAll()
+    local tests = {
+        {
+            name = "Arithmetic & Precedence",
+            fn = function()
+                local t = Lexer.lex("set x = 5 + 10 * 2", "EPL")
+                local p = Parser.new(t, "EPL")
+                local ast = p:parse()
+                local opt = Optimizer.optimizeAST(ast)
+                return opt.body[1].expr.value == 25
+            end
+        },
+        {
+            name = "Boolean & Nil Literals",
+            fn = function()
+                local t = Lexer.lex("set a = true\nset b = nil", "EPL")
+                local p = Parser.new(t, "EPL")
+                local ast = p:parse()
+                return ast.body[1].expr.tag == "bool" and ast.body[2].expr.tag == "nil"
+            end
+        },
+        {
+            name = "Python Indentation & DEDENT",
+            fn = function()
+                local py = "if score > 10:\n    print(score)\nprint(0)"
+                local toks = Lexer.lex(py, "Python")
+                local hasIndent, hasDedent = false, false
+                for _, t in ipairs(toks) do
+                    if t.kind == "INDENT" then hasIndent = true end
+                    if t.kind == "DEDENT" then hasDedent = true end
+                end
+                return hasIndent and hasDedent
+            end
+        },
+        {
+            name = "Function Declaration & VM Call Frames",
+            fn = function()
+                local src = "local function add(a, b)\n    return a + b\nend\nset res = add(10, 20)\nprint res"
+                local toks = Lexer.lex(src, "Lua")
+                local p = Parser.new(toks, "Lua")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.environment["res"] == 30
+            end
+        },
+        {
+            name = "Recursion Depth Guard",
+            fn = function()
+                local src = "local function inf()\n    return inf()\nend\ninf()"
+                local toks = Lexer.lex(src, "Lua")
+                local p = Parser.new(toks, "Lua")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED" and VM.instructionsExecuted > 0
+            end
+        },
+        {
+            name = "Watchdog Infinite Loop Prevention",
+            fn = function()
+                local ir = {
+                    instructions = {
+                        { idx = 0, op = "JMP", a = 0, line = 1, col = 1 },
+                        { idx = 1, op = "RETURN", a = "nil", line = 2, col = 1 }
+                    },
+                    constants = {},
+                    regCount = 1
+                }
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED" and VM.instructionsExecuted >= CONFIG.MAX_INSTRUCTIONS
+            end
+        },
+        {
+            name = "Translation Full-Source Hash Determinism",
+            fn = function()
+                local h1 = hashSource("set a = 1", "EPL", "Luau")
+                local h2 = hashSource("set a = 1", "EPL", "Luau")
+                local h3 = hashSource("set a = 2", "EPL", "Luau")
+                return h1 == h2 and h1 ~= h3
+            end
+        },
+        {
+            name = "Safe Optimizer (No side-effect corruption)",
+            fn = function()
+                local node = { tag = "binary", op = "+", left = { tag = "number", value = 15 }, right = { tag = "number", value = 25 } }
+                local opt = Optimizer.optimizeAST(node)
+                return opt.value == 40
+            end
+        },
+        {
+            name = "Base64 Round Trip",
+            fn = function()
+                local samples = {"", "hello", "1..2", "Hyperion ✓"}
+                for _, sample in ipairs(samples) do
+                    local encoded = Base64.encode(sample)
+                    local decoded, err = Base64.decode(encoded)
+                    if err or decoded ~= sample then return false end
+                end
+                return true
+            end
+        },
+        {
+            name = "Number vs Concatenation Lexing",
+            fn = function()
+                local toks = Lexer.lex("set x = 1 .. 2", "EPL")
+                local sawNumber, sawConcat = false, false
+                for _, t in ipairs(toks) do
+                    if t.kind == "NUMBER" and t.value == "1" then sawNumber = true end
+                    if t.kind == "OP" and t.value == ".." then sawConcat = true end
+                end
+                return sawNumber and sawConcat
+            end
+        },
+        {
+            name = "Closure Capture",
+            fn = function()
+                local src = "local x = 41\nlocal function get()\n    return x\nend\nset x = 42\nset result = get()"
+                local toks = Lexer.lex(src, "Lua")
+                local p = Parser.new(toks, "Lua")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["result"] == 42
+            end
+        },
+        {
+            name = "Short Circuit Semantics",
+            fn = function()
+                local src = "set a = false and missingFunction()\nset b = true or missingFunction()"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["a"] == false and VM.environment["b"] == true
+            end
+        },
+        {
+            name = "While Loop Execution",
+            fn = function()
+                local src = "set x = 0\nwhile x < 3 do\n    set x = x + 1\nend"
+                local toks = Lexer.lex(src, "Lua")
+                local p = Parser.new(toks, "Lua")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["x"] == 3
+            end
+        },
+        {
+            name = "Luau Truthiness Regression",
+            fn = function()
+                return isTruthy(0) and isTruthy("") and isTruthy({}) and not isTruthy(false) and not isTruthy(nil)
+            end
+        },
+        {
+            name = "Malformed IR Rejection",
+            fn = function()
+                local ok = pcall(function()
+                    VM.init({
+                        instructions = {
+                            { idx = 0, op = "JMP", a = 999, line = 1, col = 1 }
+                        },
+                        constants = {},
+                        regCount = 0
+                    })
+                end)
+                return not ok
+            end
+        },
+        {
+            name = "Register Budget Rejection",
+            fn = function()
+                local ok = pcall(function()
+                    VM.init({
+                        instructions = {
+                            { idx = 0, op = "RETURN", a = "nil", line = 1, col = 1 }
+                        },
+                        constants = {},
+                        regCount = CONFIG.MAX_REGISTERS + 1
+                    })
+                end)
+                return not ok
+            end
+        },
+        {
+            name = "Comparison Type Guard",
+            fn = function()
+                local ok = pcall(function()
+                    VM.init({
+                        instructions = {
+                            { idx = 0, op = "LOADBOOL", a = "R0", b = "true", line = 1, col = 1 },
+                            { idx = 1, op = "LOADBOOL", a = "R1", b = "false", line = 1, col = 1 },
+                            { idx = 2, op = "LT", a = "R2", b = "R0", c = "R1", line = 1, col = 1 },
+                            { idx = 3, op = "RETURN", a = "R2", line = 1, col = 1 }
+                        },
+                        constants = {},
+                        regCount = 3
+                    })
+                    VM.runContinuous()
+                end)
+                return ok and VM.state == "HALTED" and VM.lastError ~= nil
+            end
+        }
+    }
+    
+    local passed = 0
+    local results = {}
+    for _, t in ipairs(tests) do
+        local ok, res = pcall(t.fn)
+        local pass = ok and (res == true)
+        table.insert(results, { name = t.name, passed = pass })
+        if pass then passed = passed + 1 end
+    end
+    return results, passed, #tests
+end
+
+-- ============================================================================
+-- 15. RESPONSIVE GUI SETUP
+-- ============================================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "EPLHyperion"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function mk(class, props, parent)
+    local x = Instance.new(class)
+    for k, v in pairs(props or {}) do x[k] = v end
+    x.Parent = parent
+    return x
+end
+
+local function corner(x, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = x
+end
+
+local function stroke(x, col)
+    local s = Instance.new("UIStroke")
+    s.Color = col or C.border
+    s.Thickness = 1
+    s.Parent = x
+    return s
+end
+
+local function button(parent, text, col, bgCol)
+    local b = mk("TextButton", {
+        BackgroundColor3 = bgCol or C.panel2,
+        BorderSizePixel = 0,
+        Text = text,
+        TextColor3 = col or C.text,
+        TextSize = 13,
+        Font = Enum.Font.Code,
+        AutoButtonColor = false
+    }, parent)
+    corner(b, 5)
+    return b
+end
+
+-- Main Root Window with Size Constraints for Mobile / Tablet Safety
+local root = mk("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(0.92, 0, 0.88, 0),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0
+}, gui)
+corner(root, 8)
+local rootStroke = stroke(root)
+
+local sizeConstraint = Instance.new("UISizeConstraint")
+sizeConstraint.MinSize = Vector2.new(480, 360)
+sizeConstraint.MaxSize = Vector2.new(2560, 1440)
+sizeConstraint.Parent = root
+
+local uiScale = Instance.new("UIScale")
+uiScale.Name = "HyperionUIScale"
+uiScale.Scale = 1
+uiScale.Parent = root
+
+local function updateUIScale()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    uiScale.Scale = math.clamp(math.min(viewport.X / 900, viewport.Y / 650), 0.72, 1)
+end
+
+local function bindCameraScale()
+    local camera = workspace.CurrentCamera
+    if camera then camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale) end
+    updateUIScale()
+end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraScale)
+bindCameraScale()
+
+-- Header
+local top = mk("Frame", {
+    Size = UDim2.new(1, 0, 0, 38),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0
+}, root)
+corner(top, 8)
+
+local title = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(0.4, 0, 1, 0),
+    Text = "EPL Hyperion " .. CONFIG.VERSION .. " [" .. CONFIG.SUBTITLE .. "]",
+    TextColor3 = C.text,
+    TextSize = 13,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, top)
+
+local minBtn = button(top, "—", C.muted)
+minBtn.AnchorPoint = Vector2.new(1, 0.5)
+minBtn.Position = UDim2.new(1, -8, 0.5, 0)
+minBtn.Size = UDim2.fromOffset(28, 24)
+
+local themeBtn = button(top, "Theme", C.text)
+themeBtn.AnchorPoint = Vector2.new(1, 0.5)
+themeBtn.Position = UDim2.new(1, -42, 0.5, 0)
+themeBtn.Size = UDim2.fromOffset(68, 24)
+
+local shareBtn = button(top, "Share", C.green)
+shareBtn.AnchorPoint = Vector2.new(1, 0.5)
+shareBtn.Position = UDim2.new(1, -116, 0.5, 0)
+shareBtn.Size = UDim2.fromOffset(68, 24)
+
+local openPill = button(gui, "Hyperion", C.blue, C.panel)
+openPill.AnchorPoint = Vector2.new(1, 0.5)
+openPill.Position = UDim2.new(1, -14, 0.5, 0)
+openPill.Size = UDim2.fromOffset(95, 34)
+openPill.Visible = false
+corner(openPill, 6)
+stroke(openPill)
+
+-- Sidebar & Center Body
+local side = mk("Frame", {
+    Position = UDim2.fromOffset(0, 38),
+    Size = UDim2.new(0, 220, 1, -66),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0
+}, root)
+
+local center = mk("Frame", {
+    Position = UDim2.fromOffset(220, 38),
+    Size = UDim2.new(1, -220, 1, -66),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0
+}, root)
+
+-- Status Bar
+local statusBar = mk("Frame", {
+    Position = UDim2.new(0, 0, 1, -28),
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = C.panel2,
+    BorderSizePixel = 0
+}, root)
+
+local statusLabel = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 0),
+    Size = UDim2.new(1, -20, 1, 0),
+    Text = "Ready  |  Ln 1, Col 1  |  EPL  |  Watchdog: 1.0s / 100k ops",
+    TextColor3 = C.muted,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, statusBar)
+
+-- Side File List & Tree
+local sideLabel = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 6),
+    Size = UDim2.new(1, -20, 0, 20),
+    Text = "PROJECT FILES",
+    TextColor3 = C.muted,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, side)
+
+local fileList = mk("ScrollingFrame", {
+    Position = UDim2.fromOffset(6, 28),
+    Size = UDim2.new(1, -12, 1, -34),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    CanvasSize = UDim2.new()
+}, side)
+local fileLayout = mk("UIListLayout", { Padding = UDim.new(0, 3) }, fileList)
+
+-- Tabs Bar
+local tabsBar = mk("Frame", {
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundColor3 = C.panel2,
+    BorderSizePixel = 0
+}, center)
+
+local tabsContainer = mk("ScrollingFrame", {
+    Size = UDim2.new(1, -40, 1, 0),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 0,
+    CanvasSize = UDim2.new()
+}, tabsBar)
+local tabsLayout = mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabsContainer)
+
+-- Editor Frame
+local editorFrame = mk("Frame", {
+    Position = UDim2.fromOffset(0, 32),
+    Size = UDim2.new(1, 0, 1, -192),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    ClipsDescendants = true
+}, center)
+
+local gutter = mk("TextLabel", {
+    Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.fromOffset(44, 5000),
+    BackgroundColor3 = C.gutter,
+    BorderSizePixel = 0,
+    Text = "1",
+    TextColor3 = C.gutterText,
+    TextSize = 13,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    TextYAlignment = Enum.TextYAlignment.Top
+}, editorFrame)
+
+-- Editable plain TextBox
+local editor = mk("TextBox", {
+    Position = UDim2.fromOffset(50, 0),
+    Size = UDim2.new(1, -54, 5000, 0),
+    BackgroundTransparency = 1,
+    ClearTextOnFocus = false,
+    MultiLine = true,
+    Text = "",
+    TextColor3 = C.text,
+    TextSize = 13,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = false
+}, editorFrame)
+editor.TextEditable = true
+
+-- Separate rich syntax overlay label (avoids focused XML tag corruption)
+local syntaxOverlay = mk("TextLabel", {
+    Position = editor.Position,
+    Size = editor.Size,
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = C.text,
+    TextSize = 13,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = false,
+    RichText = true,
+    Visible = false
+}, editorFrame)
+
+editor.Focused:Connect(function()
+    syntaxOverlay.Visible = false
+    editor.TextTransparency = 0
+end)
+
+editor.FocusLost:Connect(function()
+    syntaxOverlay.Visible = true
+    editor.TextTransparency = 1
+end)
+
+-- Toolbar
+local toolbar = mk("Frame", {
+    Position = UDim2.new(0, 0, 1, -160),
+    Size = UDim2.new(1, 0, 0, 36),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0
+}, center)
+
+local runBtn = button(toolbar, "▶ Run", C.green)
+runBtn.Position = UDim2.fromOffset(6, 4)
+runBtn.Size = UDim2.fromOffset(64, 26)
+
+local transBtn = button(toolbar, "Translate", C.blue)
+transBtn.Position = UDim2.fromOffset(74, 4)
+transBtn.Size = UDim2.fromOffset(78, 26)
+
+local optBtn = button(toolbar, "Optimize", C.yellow)
+optBtn.Position = UDim2.fromOffset(156, 4)
+optBtn.Size = UDim2.fromOffset(74, 26)
+
+local targetBtn = button(toolbar, "Target: Luau", C.text)
+targetBtn.Position = UDim2.fromOffset(234, 4)
+targetBtn.Size = UDim2.fromOffset(100, 26)
+
+local testBtn = button(toolbar, "Tests", C.cyan)
+testBtn.Position = UDim2.fromOffset(338, 4)
+testBtn.Size = UDim2.fromOffset(60, 26)
+
+local clearBtn = button(toolbar, "Clear", C.muted)
+clearBtn.Position = UDim2.fromOffset(402, 4)
+clearBtn.Size = UDim2.fromOffset(56, 26)
+
+-- GUI Diagnostics button
+local errorsBtn = button(toolbar, "Errors", C.red)
+errorsBtn.Position = UDim2.fromOffset(464, 4)
+errorsBtn.Size = UDim2.fromOffset(64, 26)
+
+-- Terminal & Output Dock
+local terminal = mk("Frame", {
+    Position = UDim2.new(0, 0, 1, -124),
+    Size = UDim2.new(1, 0, 0, 124),
+    BackgroundColor3 = Color3.fromRGB(11, 12, 15),
+    BorderSizePixel = 0
+}, center)
+
+local termHeader = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 2),
+    Size = UDim2.new(1, -16, 0, 18),
+    Text = "TERMINAL",
+    TextColor3 = C.muted,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, terminal)
+
+local outLabel = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(8, 22),
+    Size = UDim2.new(1, -16, 1, -26),
+    Text = "EPL Hyperion " .. CONFIG.VERSION .. " Ready.",
+    TextColor3 = Color3.fromRGB(175, 215, 180),
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = true
+}, terminal)
+
+local logs = {}
+local consoleErrors = {}
+local consolePanelOpen = false
+
+local function safeErrorText(value)
+    local s = tostring(value)
+    if #s > 4000 then s = s:sub(1, 4000) .. "\n...[truncated]" end
+    return s
+end
+
+-- Developer Console note: Roblox does not expose the /console history as a
+-- readable client API. This viewer therefore records Hyperion-owned failures
+-- at their source instead of pretending to scrape Roblox's console.\n-- Hyperion-owned console diagnostics. User-program execution output is kept
+-- in the normal terminal and is never mixed into this list.
+local function addConsoleError(message, source)
+    table.insert(consoleErrors, {
+        message = safeErrorText(message),
+        source = tostring(source or "Hyperion"),
+        time = os.date("%H:%M:%S")
+    })
+    if #consoleErrors > CONFIG.MAX_LOG_ENTRIES then
+        table.remove(consoleErrors, 1)
+    end
+end
+
+local function log(msg)
+    local textValue = safeErrorText(msg)
+    table.insert(logs, textValue)
+    if #logs > CONFIG.MAX_LOG_ENTRIES then table.remove(logs, 1) end
+    outLabel.Text = table.concat(logs, "\n")
+end
+
+local consolePanel = mk("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.new(0.82, 0, 0.74, 0),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 50
+}, root)
+corner(consolePanel, 8)
+stroke(consolePanel, C.red)
+
+local consoleTitle = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(12, 6),
+    Size = UDim2.new(1, -180, 0, 26),
+    Text = "CONSOLE ERRORS",
+    TextColor3 = C.red,
+    TextSize = 13,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 51
+}, consolePanel)
+
+local consoleCount = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(1, -165, 0, 6),
+    Size = UDim2.fromOffset(153, 26),
+    Text = "0 errors",
+    TextColor3 = C.muted,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    ZIndex = 51
+}, consolePanel)
+
+local consoleClose = button(consolePanel, "Close", C.text)
+consoleClose.Position = UDim2.new(1, -74, 0, 36)
+consoleClose.Size = UDim2.fromOffset(62, 24)
+consoleClose.ZIndex = 52
+
+local consoleClear = button(consolePanel, "Clear", C.muted)
+consoleClear.Position = UDim2.new(1, -144, 0, 36)
+consoleClear.Size = UDim2.fromOffset(62, 24)
+consoleClear.ZIndex = 52
+
+local consoleCopy = button(consolePanel, "Copy", C.green)
+consoleCopy.Position = UDim2.new(1, -214, 0, 36)
+consoleCopy.Size = UDim2.fromOffset(62, 24)
+consoleCopy.ZIndex = 52
+
+local consoleList = mk("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, 68),
+    Size = UDim2.new(1, -20, 1, -78),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 5,
+    CanvasSize = UDim2.new(),
+    ZIndex = 51
+}, consolePanel)
+corner(consoleList, 5)
+
+local consoleLayout = mk("UIListLayout", {
+    Padding = UDim.new(0, 5),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, consoleList)
+
+local consoleCopyBox = mk("TextBox", {
+    Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.fromOffset(2, 2),
+    BackgroundTransparency = 1,
+    TextTransparency = 1,
+    Text = "",
+    ClearTextOnFocus = false,
+    TextEditable = false,
+    MultiLine = true,
+    ZIndex = 53
+}, consolePanel)
+
+local function formatConsoleError(entry)
+    return string.format("[%s] %s\n%s", entry.time, entry.source, entry.message)
+end
+
+local function rebuildConsoleErrors()
+    for _, child in ipairs(consoleList:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    consoleCount.Text = string.format("%d error%s", #consoleErrors, #consoleErrors == 1 and "" or "s")
+
+    for index, entry in ipairs(consoleErrors) do
+        local item = mk("TextButton", {
+            Size = UDim2.new(1, -8, 0, 58),
+            BackgroundColor3 = C.panel2,
+            BorderSizePixel = 0,
+            Text = formatConsoleError(entry),
+            TextColor3 = C.text,
+            TextSize = 11,
+            Font = Enum.Font.Code,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true,
+            AutoButtonColor = false,
+            LayoutOrder = index,
+            ZIndex = 52
+        }, consoleList)
+        corner(item, 5)
+        item.Activated:Connect(function()
+            consoleCopyBox.Text = formatConsoleError(entry)
+            consoleCopyBox:CaptureFocus()
+            consoleCopyBox.SelectionStart = 1
+            consoleCopyBox.CursorPosition = #consoleCopyBox.Text + 1
+        end)
+    end
+    consoleList.CanvasSize = UDim2.new(0, 0, 0, consoleLayout.AbsoluteContentSize.Y + 8)
+end
+
+local function reportConsoleError(message, source)
+    addConsoleError(message, source)
+    if consolePanelOpen then rebuildConsoleErrors() end
+end
+
+consoleLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    consoleList.CanvasSize = UDim2.new(0, 0, 0, consoleLayout.AbsoluteContentSize.Y + 8)
+end)
+
+local function guardConsoleAction(name, callback)
+    return function(...)
+        local ok, err = xpcall(callback, function(e) return safeErrorText(e) end, ...)
+        if not ok then
+            reportConsoleError(err, "UI:" .. name)
+        end
+    end
+end
+
+errorsBtn.Activated:Connect(guardConsoleAction("ErrorsOpen", function()
+    consolePanelOpen = true
+    rebuildConsoleErrors()
+    consolePanel.Visible = true
+end))
+
+consoleClose.Activated:Connect(guardConsoleAction("ErrorsClose", function()
+    consolePanelOpen = false
+    consolePanel.Visible = false
+end))
+
+consoleClear.Activated:Connect(guardConsoleAction("ErrorsClear", function()
+    table.clear(consoleErrors)
+    rebuildConsoleErrors()
+    log("Console error history cleared.")
+end))
+
+consoleCopy.Activated:Connect(guardConsoleAction("ErrorsCopy", function()
+    if consoleCopyBox.Text == "" then
+        log("Select a console error first.")
+        return
+    end
+    consoleCopyBox:CaptureFocus()
+    consoleCopyBox.SelectionStart = 1
+    consoleCopyBox.CursorPosition = #consoleCopyBox.Text + 1
+    log("Console error selected. Use the platform Copy action to copy it.")
+end))
+
+-- Route Hyperion-owned failures here. Do not route user-program VM errors.
+local function reportHyperionError(message, source)
+    reportConsoleError(message, source or "Hyperion")
+    log("[Console Error] " .. tostring(source or "Hyperion") .. ": " .. safeErrorText(message))
+end
+
+
+-- ============================================================================
+-- 15.5. MAJOR UI VISUAL REVAMP
+-- ============================================================================
+-- Visual-only styling layer. Existing controls and behavior are preserved.
+local function hyperionGradient(parent, a, b, rotation)
+    local g = parent:FindFirstChild("HyperionGradient")
+    if not g then
+        g = Instance.new("UIGradient")
+        g.Name = "HyperionGradient"
+        g.Parent = parent
+    end
+    g.Color = ColorSequence.new(a, b)
+    g.Rotation = rotation or 90
+end
+
+local function hyperionStroke(parent, color, transparency, thickness)
+    local s = parent:FindFirstChild("HyperionStroke")
+    if not s then
+        s = Instance.new("UIStroke")
+        s.Name = "HyperionStroke"
+        s.Parent = parent
+    end
+    s.Color = color
+    s.Transparency = transparency or 0.35
+    s.Thickness = thickness or 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+end
+
+local function hyperionCorner(parent, radius)
+    local c = parent:FindFirstChild("HyperionCorner")
+    if not c then
+        c = Instance.new("UICorner")
+        c.Name = "HyperionCorner"
+        c.Parent = parent
+    end
+    c.CornerRadius = UDim.new(0, radius or 8)
+end
+
+local function styleHyperionButton(btn, accent)
+    if not btn or not btn:IsA("GuiButton") then return end
+    btn.Active = true
+    btn.AutoButtonColor = false
+    btn.BackgroundColor3 = C.panel2
+    btn.TextColor3 = C.text
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = math.clamp(btn.TextSize, 11, 13)
+    hyperionCorner(btn, 7)
+    hyperionStroke(btn, accent or C.border, 0.45, 1)
+
+    if not btn:GetAttribute("HyperionHoverBound") then
+        btn:SetAttribute("HyperionHoverBound", true)
+        btn.MouseEnter:Connect(function()
+            btn.BackgroundColor3 = C.panel
+            local s = btn:FindFirstChild("HyperionStroke")
+            if s then s.Transparency = 0.05; s.Thickness = 1.25 end
+        end)
+        btn.MouseLeave:Connect(function()
+            btn.BackgroundColor3 = C.panel2
+            local s = btn:FindFirstChild("HyperionStroke")
+            if s then s.Transparency = 0.45; s.Thickness = 1 end
+        end)
+    end
+end
+
+local function applyMajorUIRevamp()
+    -- Main window.
+    root.BackgroundColor3 = C.bg
+    root.BackgroundTransparency = 0
+    root.ClipsDescendants = true
+    hyperionCorner(root, 12)
+    hyperionStroke(root, C.border, 0.08, 1)
+    hyperionGradient(root, C.bg, C.panel, 90)
+
+    -- Header / application chrome.
+    top.BackgroundColor3 = C.panel
+    hyperionCorner(top, 10)
+    hyperionStroke(top, C.border, 0.3, 1)
+    hyperionGradient(top, C.panel, C.panel2, 0)
+
+    toolbar.BackgroundColor3 = C.panel2
+    hyperionCorner(toolbar, 8)
+    hyperionStroke(toolbar, C.border, 0.42, 1)
+
+    tabsBar.BackgroundColor3 = C.panel2
+    hyperionCorner(tabsBar, 7)
+    hyperionStroke(tabsBar, C.border, 0.5, 1)
+
+    -- Main workspace surfaces.
+    side.BackgroundColor3 = C.panel
+    hyperionCorner(side, 9)
+    hyperionStroke(side, C.border, 0.5, 1)
+
+    center.BackgroundColor3 = C.bg
+    editorFrame.BackgroundColor3 = C.bg
+    hyperionCorner(editorFrame, 8)
+    hyperionStroke(editorFrame, C.border, 0.42, 1)
+
+    terminal.BackgroundColor3 = C.panel
+    hyperionCorner(terminal, 8)
+    hyperionStroke(terminal, C.border, 0.45, 1)
+
+    statusBar.BackgroundColor3 = C.panel2
+    hyperionCorner(statusBar, 7)
+    hyperionStroke(statusBar, C.border, 0.5, 1)
+
+    gutter.BackgroundColor3 = C.gutter
+    gutter.BackgroundTransparency = 0.08
+    hyperionStroke(gutter, C.border, 0.72, 1)
+
+    -- Editor typography.
+    editor.Font = Enum.Font.Code
+    editor.TextSize = 14
+    syntaxOverlay.Font = Enum.Font.Code
+    syntaxOverlay.TextSize = 14
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    statusLabel.Font = Enum.Font.GothamMedium
+    sideLabel.Font = Enum.Font.GothamBold
+    termHeader.Font = Enum.Font.GothamBold
+
+    -- Consistent button language.
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("TextButton") or obj:IsA("ImageButton") then
+            styleHyperionButton(obj, C.border)
+        end
+    end
+
+    styleHyperionButton(runBtn, C.green)
+    styleHyperionButton(transBtn, C.blue)
+    styleHyperionButton(optBtn, C.yellow)
+    styleHyperionButton(testBtn, C.cyan)
+    styleHyperionButton(shareBtn, C.green)
+    styleHyperionButton(errorsBtn, C.red)
+
+    -- Console/error viewer.
+    consolePanel.BackgroundColor3 = C.panel
+    hyperionCorner(consolePanel, 10)
+    hyperionStroke(consolePanel, C.red, 0.18, 1)
+    consoleList.BackgroundColor3 = C.bg
+    hyperionCorner(consoleList, 7)
+    hyperionStroke(consoleList, C.border, 0.55, 1)
+
+    if openPill then
+        openPill.BackgroundColor3 = C.panel
+        hyperionCorner(openPill, 10)
+        hyperionStroke(openPill, C.border, 0.2, 1)
+    end
+end
+
+applyMajorUIRevamp()
+
+-- ============================================================================
+-- 16. BUTTON ACTION WIRING & UI ACTION SAFETY
+-- ============================================================================
+local currentLanguage = "EPL"
+local targetLanguages = { "Luau", "Lua", "Python", "EPL", "IR" }
+local targetIndex = 1
+
+local function countErrors(diags)
+    local n = 0
+    for _, d in ipairs(diags or {}) do
+        if d.severity == "ERROR" then n += 1 end
+    end
+    return n
+end
+
+local function showDiagnostics(diags)
+    local errors = countErrors(diags)
+    if errors > 0 then
+        for _, d in ipairs(diags or {}) do
+            log(string.format("[%s] %s:%s:%s - %s", d.severity or "ERROR", d.stage or "Compiler", d.line or 1, d.col or 1, d.message or "Unknown diagnostic"))
+        end
+        statusLabel.Text = string.format("%d compiler error%s", errors, errors == 1 and "" or "s")
+        return false
+    end
+    return true
+end
+
+local function parseEditorSource()
+    local source = editor.Text or ""
+    if #source == 0 then
+        statusLabel.Text = "Nothing to compile"
+        log("Nothing to compile.")
+        return nil
+    end
+    local ok, tokensOrErr = pcall(Lexer.lex, source, currentLanguage)
+    if not ok then
+        log("[Lexer] " .. safeErrorText(tokensOrErr))
+        statusLabel.Text = "Lexer error"
+        return nil
+    end
+    for _, token in ipairs(tokensOrErr) do
+        if token.kind == "ERROR" then
+            log(string.format("[Lexer] %s:%s - %s", token.line or 1, token.col or 1, tostring(token.value)))
+            statusLabel.Text = "Lexer error"
+            return nil
+        end
+    end
+    local parser = Parser.new(tokensOrErr, currentLanguage)
+    local okParse, ast, diags = pcall(function() return parser:parse() end)
+    if not okParse then
+        log("[Parser] " .. safeErrorText(ast))
+        statusLabel.Text = "Parser error"
+        return nil
+    end
+    if not showDiagnostics(diags) then return nil end
+    return ast
+end
+
+local function refreshTheme()
+    root.BackgroundColor3 = C.bg
+    rootStroke.Color = C.border
+    top.BackgroundColor3 = C.panel
+    side.BackgroundColor3 = C.panel
+    center.BackgroundColor3 = C.bg
+    statusBar.BackgroundColor3 = C.panel2
+    toolbar.BackgroundColor3 = C.panel
+    tabsBar.BackgroundColor3 = C.panel2
+    terminal.BackgroundColor3 = Color3.fromRGB(11, 12, 15)
+    editorFrame.BackgroundColor3 = C.bg
+    gutter.BackgroundColor3 = C.gutter
+    gutter.TextColor3 = C.gutterText
+    editor.TextColor3 = C.text
+    syntaxOverlay.TextColor3 = C.text
+    title.TextColor3 = C.text
+    statusLabel.TextColor3 = C.muted
+    sideLabel.TextColor3 = C.muted
+    termHeader.TextColor3 = C.muted
+    outLabel.TextColor3 = C.text
+    consolePanel.BackgroundColor3 = C.panel
+    consoleList.BackgroundColor3 = C.bg
+    consoleTitle.TextColor3 = C.red
+    consoleCount.TextColor3 = C.muted
+    consoleCopyBox.TextColor3 = C.text
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("TextButton") then
+            obj.TextColor3 = C.text
+        elseif obj:IsA("TextLabel") and obj ~= title and obj ~= statusLabel and obj ~= sideLabel and obj ~= termHeader and obj ~= outLabel and obj ~= consoleTitle and obj ~= consoleCount then
+            obj.TextColor3 = C.text
+        end
+    end
+    themeBtn.TextColor3 = C.text
+    shareBtn.TextColor3 = C.green
+    runBtn.TextColor3 = C.green
+    transBtn.TextColor3 = C.blue
+    optBtn.TextColor3 = C.yellow
+    targetBtn.TextColor3 = C.text
+    testBtn.TextColor3 = C.cyan
+    clearBtn.TextColor3 = C.muted
+    errorsBtn.TextColor3 = C.red
+    statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. currentLanguage .. " → " .. targetLanguages[targetIndex]
+    if applyMajorUIRevamp then applyMajorUIRevamp() end
+end
+
+local function safeAction(name, callback)
+    return function(...)
+        local args = table.pack(...)
+        local ok, err = xpcall(function()
+            callback(table.unpack(args, 1, args.n))
+        end, function(e)
+            local message = safeErrorText(e)
+            reportHyperionError(message, "UI:" .. name)
+            return message
+        end)
+        return ok
+    end
+end
+
+local sharePanel
+local shareBox
+local function openSharePanel()
+    if sharePanel then sharePanel:Destroy() end
+    sharePanel = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.new(0.82, 0, 0.62, 0), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ZIndex = 60
+    }, root)
+    corner(sharePanel, 8); stroke(sharePanel, C.green)
+    local label = mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 8),
+        Size = UDim2.new(1, -90, 0, 24), Text = "SHARE CODE", TextColor3 = C.green,
+        TextSize = 13, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 61 }, sharePanel)
+    local close = button(sharePanel, "Close", C.text); close.Position = UDim2.new(1, -74, 0, 8); close.Size = UDim2.fromOffset(62, 24); close.ZIndex = 62
+    shareBox = mk("TextBox", { Position = UDim2.fromOffset(10, 42), Size = UDim2.new(1, -20, 1, -52),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = "", TextColor3 = C.text,
+        TextSize = 11, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, MultiLine = true,
+        ClearTextOnFocus = false, TextEditable = false, ZIndex = 61 }, sharePanel)
+    corner(shareBox, 5)
+    local ok, encoded = pcall(Base64.encode, editor.Text or "")
+    if ok then
+        shareBox.Text = encoded
+        shareBox:CaptureFocus()
+        shareBox.SelectionStart = 1
+        shareBox.CursorPosition = #encoded + 1
+        log("Share code generated and selected for copying.")
+    else
+        shareBox.Text = "Share generation failed: " .. safeErrorText(encoded)
+        reportHyperionError(encoded, "Share")
+    end
+    close.Activated:Connect(function() sharePanel:Destroy(); sharePanel = nil end)
+end
+
+minBtn.Activated:Connect(safeAction("Minimize", function()
+    root.Visible = false; openPill.Visible = true
+end))
+openPill.Activated:Connect(safeAction("Restore", function()
+    root.Visible = true; openPill.Visible = false
+end))
+
+themeBtn.Activated:Connect(safeAction("Theme", function()
+    local names = {}
+    for name in pairs(THEMES) do table.insert(names, name) end
+    table.sort(names)
+    local current = table.find(names, currentThemeName) or 1
+    current = (current % #names) + 1
+    currentThemeName = names[current]
+    C = THEMES[currentThemeName]
+    refreshTheme()
+    log("Theme changed to " .. currentThemeName .. ".")
+end))
+
+shareBtn.Activated:Connect(safeAction("Share", openSharePanel))
+
+clearBtn.Activated:Connect(safeAction("Clear", function()
+    editor.Text = ""
+    syntaxOverlay.Text = ""
+    gutter.Text = "1"
+    statusLabel.Text = "Editor cleared"
+    log("Editor cleared.")
+end))
+
+targetBtn.Activated:Connect(safeAction("Target", function()
+    targetIndex = (targetIndex % #targetLanguages) + 1
+    targetBtn.Text = "Target: " .. targetLanguages[targetIndex]
+    statusLabel.Text = currentLanguage .. " → " .. targetLanguages[targetIndex]
+end))
+
+transBtn.Activated:Connect(safeAction("Translate", function()
+    local target = targetLanguages[targetIndex]
+    local result = translateSource(editor.Text or "", currentLanguage, target)
+    editor.Text = result
+    syntaxOverlay.Text = ""
+    statusLabel.Text = "Translated: " .. currentLanguage .. " → " .. target
+    log("Translation complete: " .. currentLanguage .. " → " .. target .. ".")
+end))
+
+optBtn.Activated:Connect(safeAction("Optimize", function()
+    local ast = parseEditorSource()
+    if not ast then return end
+    local optimized = Optimizer.optimizeAST(ast)
+    local target = targetLanguages[targetIndex]
+    local result
+    if target == "IR" then
+        result = HyperionIR.disassemble(Optimizer.optimizeIR(HyperionIR.fromAST(optimized)))
+    elseif target == "Luau" or target == "Lua" then
+        result = TargetGen.toLuau(optimized)
+    elseif target == "Python" then
+        result = TargetGen.toPython(optimized)
+    else
+        result = TargetGen.toEPL(optimized)
+    end
+    editor.Text = result
+    syntaxOverlay.Text = ""
+    statusLabel.Text = "Optimized → " .. target
+    log("Optimization complete. Output regenerated as " .. target .. ".")
+end))
+
+runBtn.Activated:Connect(safeAction("Run", function()
+    local ast = parseEditorSource()
+    if not ast then return end
+    local ir = HyperionIR.fromAST(ast)
+    VM.init(ir)
+    VM.runContinuous()
+    statusLabel.Text = "Run finished: " .. VM.state
+    log("Program run finished with VM state: " .. tostring(VM.state) .. ".")
+end))
+
+testBtn.Activated:Connect(safeAction("Tests", function()
+    local results, passed, total = TestRunner.runAll()
+    log(string.format("Self-tests: %d/%d passed.", passed, total))
+    for _, result in ipairs(results) do
+        log(string.format("[%s] %s", result.passed and "PASS" or "FAIL", result.name))
+    end
+    statusLabel.Text = string.format("Self-tests: %d/%d passed", passed, total)
+end))
+
+-- Keep the editor visually synchronized after actions.
+editor:GetPropertyChangedSignal("Text"):Connect(function()
+    if #editor.Text > CONFIG.MAX_SOURCE_BYTES then
+        editor.Text = editor.Text:sub(1, CONFIG.MAX_SOURCE_BYTES)
+        log("Source truncated at " .. CONFIG.MAX_SOURCE_BYTES .. " bytes.")
+    end
+end)
+
+-- Dragging support
+local dragging, dragStart, startPos = false, nil, nil
+top.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = root.Position
+    end
+end)
+top.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
