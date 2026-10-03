@@ -1,44 +1,52 @@
--- EPL Hyperion 2.0.2 - single LocalScript
--- Subtitle: Compiler Core Hardening
+-- EPL Hyperion 2.1.0 - single LocalScript
+-- Subtitle: Debugger & IDE Edition
 -- Place in StarterPlayer > StarterPlayerScripts
--- Client-side IDE, compiler, VM sandbox & debugger.
+-- Fully client-side and self-contained: no server, no remotes, no DataStore.
+-- Client-side IDE, compiler, VM sandbox, translator & step debugger.
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
+local TextService = game:GetService("TextService")
 local player = Players.LocalPlayer
 
 -- ============================================================================
 -- 1. HARDENED CONFIGURATION & RESOURCE LIMITS
 -- ============================================================================
 local CONFIG = {
-    VERSION               = "2.0.2",
-    SUBTITLE              = "Compiler Core Hardening",
+    VERSION               = "2.1.0",
+    SUBTITLE              = "Debugger & IDE Edition",
     MAX_SOURCE_BYTES      = 100000,   -- 100 KB max source code
     MAX_TOKEN_COUNT       = 20000,    -- 20,000 tokens limit
     MAX_AST_NODES         = 12000,    -- 12,000 AST nodes limit
     MAX_EXPRESSION_DEPTH  = 128,      -- 128 recursive depth limit
     MAX_IR_INSTRUCTIONS   = 25000,    -- 25,000 IR instructions limit
     MAX_REGISTERS         = 4096,     -- 4,096 VM registers per frame
-    MAX_CONSTANTS          = 8192,     -- 8,192 IR constants
-    MAX_CALL_ARGS         = 128,     -- Maximum arguments per VM call
+    MAX_CONSTANTS         = 8192,     -- 8,192 IR constants
+    MAX_CALL_ARGS         = 128,      -- Maximum arguments per VM call
     MAX_CLOSURE_DEPTH     = 64,       -- Maximum lexical parent depth
     MAX_LOG_ENTRIES       = 100,      -- Maximum terminal log entries
     MAX_SHARE_BYTES       = 120000,   -- Maximum encoded share payload
-    MAX_RUNTIME_SEC       = 1.0,      -- 1.0 second VM execution budget
+    MAX_RUNTIME_SEC       = 1.0,      -- 1.0 second VM execution budget per run
     MAX_INSTRUCTIONS      = 100000,   -- 100,000 VM opcodes budget
     MAX_RECURSION_DEPTH   = 64,       -- 64 VM call frames limit
     MAX_OUTPUT_BYTES      = 10240,    -- 10 KB terminal output buffer
-    WATCHDOG_CHECK_FREQ   = 32,       -- Watchdog checked every 32 instructions
-    DEBOUNCE_DELAY_SEC    = 0.20,     -- Keystroke analysis debouncing delay
+    WATCHDOG_CHECK_FREQ   = 1,        -- Watchdog is checked on every instruction
+    DEBOUNCE_DELAY_SEC    = 0.20,     -- Syntax highlight refresh debounce delay
+    MAX_CACHE_ENTRIES     = 50,       -- Translation cache LRU cap
+    MAX_GUTTER_LINES      = 2000,     -- Max clickable gutter rows rendered
+    MAX_DOCUMENTS         = 12,       -- Max open editor documents
+    EDITOR_TEXT_SIZE      = 14,       -- Editor font size in px
+    MAX_INSPECTOR_REGS    = 40,       -- Max registers shown in the inspector
 }
 
 -- ============================================================================
 -- 2. DETERMINISTIC FULL-SOURCE HASHING FOR TRANSLATION CACHE
+--    (length is part of the key to reduce collision impact)
 -- ============================================================================
 local function hashSource(str, fromLang, toLang)
     local h = 2166136261
     local prime = 16777619
-    local combined = "v" .. CONFIG.VERSION .. ":" .. fromLang .. "->" .. toLang .. ":" .. str
+    local combined = "v" .. CONFIG.VERSION .. ":" .. fromLang .. "->" .. toLang .. ":" .. #str .. ":" .. str
     for i = 1, #combined do
         local b = string.byte(combined, i)
         if bit32 then
@@ -168,6 +176,8 @@ local C = THEMES[currentThemeName]
 
 -- ============================================================================
 -- 4. BASE64 ENCODING & SHARE CODES
+--    (built-in encoder rewritten to iterate byte-wise; the previous version
+--     unpacked the whole payload onto the Lua stack and crashed on large input)
 -- ============================================================================
 local BuiltInBase64 = {}
 local B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -179,10 +189,9 @@ end
 
 function BuiltInBase64.encode(data)
     validateSharePayload(data)
-    local bytes = {string.byte(data, 1, #data)}
     local result = {}
-    for i = 1, #bytes, 3 do
-        local b1, b2, b3 = bytes[i], bytes[i+1], bytes[i+2]
+    for i = 1, #data, 3 do
+        local b1, b2, b3 = string.byte(data, i, i + 2)
         local n = (b1 * 65536) + ((b2 or 0) * 256) + (b3 or 0)
         local c1 = math.floor(n / 262144) % 64 + 1
         local c2 = math.floor(n / 4096) % 64 + 1
@@ -261,7 +270,7 @@ local PY_KEYWORDS = {
 }
 
 -- ============================================================================
--- 6. LEXER ENGINE (With Python NEWLINE, INDENT & DEDENT handling)
+-- 6. LEXER ENGINE (Python NEWLINE/INDENT/DEDENT, hex & exponent numbers)
 -- ============================================================================
 local Lexer = {}
 
@@ -273,14 +282,14 @@ function Lexer.lex(src, lang)
     if #src > CONFIG.MAX_SOURCE_BYTES then
         error(string.format("[Hyperion Lexer] Source exceeds %d bytes limit", CONFIG.MAX_SOURCE_BYTES), 0)
     end
-    
+
     local tokens = {}
     local len = #src
     local i, line, col = 1, 1, 1
-    
+
     local isPython = (lang == "Python")
     local keywords = isPython and PY_KEYWORDS or (lang == "EPL" and EPL_KEYWORDS or LUA_KEYWORDS)
-    
+
     local indentStack = { 0 }
     local atLineStart = true
     local lineIndentSpaces = 0
@@ -300,7 +309,7 @@ function Lexer.lex(src, lang)
         if #tokens >= CONFIG.MAX_TOKEN_COUNT then
             error(string.format("[Hyperion Lexer] Token count limit exceeded (%d)", CONFIG.MAX_TOKEN_COUNT), 0)
         end
-        
+
         -- Handle Python Indentation at beginning of logical line
         if isPython and atLineStart then
             lineIndentSpaces = 0
@@ -316,7 +325,7 @@ function Lexer.lex(src, lang)
                     break
                 end
             end
-            
+
             -- Ignore empty lines or comment-only lines for indentation
             local nextChar = src:sub(i, i)
             if nextChar == "\n" or nextChar == "#" or i > len then
@@ -404,7 +413,7 @@ function Lexer.lex(src, lang)
                 advance(ch)
                 i = i + 1
             end
-            
+
             local kind = "IDENT"
             if s == "true" or s == "false" or s == "True" or s == "False" then
                 kind = "BOOL_LIT"
@@ -415,22 +424,53 @@ function Lexer.lex(src, lang)
             end
             table.insert(tokens, createToken(kind, s, sl, sc))
 
-        -- Numbers
+        -- Numbers: decimals, hex (0xFF), exponents (1e5, 2.5e-3)
         elseif c:match("%d") then
             local sl, sc = line, col
             local s = ""
-            local dotSeen = false
-            while i <= len do
-                local ch = src:sub(i, i)
-                if ch:match("%d") then
+            if c == "0" and (src:sub(i+1, i+1) == "x" or src:sub(i+1, i+1) == "X") then
+                s = s .. c .. src:sub(i+1, i+1)
+                advance(c); i = i + 1
+                advance(src:sub(i, i)); i = i + 1
+                while i <= len and src:sub(i, i):match("[%x]") do
+                    local ch = src:sub(i, i)
                     s = s .. ch
                     advance(ch); i = i + 1
-                elseif ch == "." and not dotSeen and src:sub(i+1, i+1) ~= "." then
-                    dotSeen = true
-                    s = s .. ch
-                    advance(ch); i = i + 1
-                else
-                    break
+                end
+            else
+                local dotSeen = false
+                while i <= len do
+                    local ch = src:sub(i, i)
+                    if ch:match("%d") then
+                        s = s .. ch
+                        advance(ch); i = i + 1
+                    elseif ch == "." and not dotSeen and src:sub(i+1, i+1) ~= "." then
+                        dotSeen = true
+                        s = s .. ch
+                        advance(ch); i = i + 1
+                    else
+                        break
+                    end
+                end
+                -- Exponent part: e/E followed by optional sign and digits
+                local ec = src:sub(i, i)
+                if ec == "e" or ec == "E" then
+                    local j = i + 1
+                    local sign = src:sub(j, j)
+                    if sign == "+" or sign == "-" then j = j + 1 end
+                    if src:sub(j, j):match("%d") then
+                        s = s .. ec
+                        advance(ec); i = i + 1
+                        if sign == "+" or sign == "-" then
+                            s = s .. sign
+                            advance(sign); i = i + 1
+                        end
+                        while i <= len and src:sub(i, i):match("%d") do
+                            local ch = src:sub(i, i)
+                            s = s .. ch
+                            advance(ch); i = i + 1
+                        end
+                    end
                 end
             end
             table.insert(tokens, createToken("NUMBER", s, sl, sc))
@@ -469,7 +509,7 @@ function Lexer.lex(src, lang)
 end
 
 -- ============================================================================
--- 7. PARSER & AST ENGINE (Language-Aware & Complete Function AST Support)
+-- 7. PARSER & AST ENGINE (Language-Aware, Functions, For-Loops, Elif)
 -- ============================================================================
 local Parser = {}
 Parser.__index = Parser
@@ -526,6 +566,24 @@ function Parser:expect(val)
     return self:take()
 end
 
+-- Kind-based matching for structural tokens (INDENT/DEDENT/NEWLINE), whose
+-- values carry payloads (indent width, "\n") rather than their kind name.
+function Parser:matchKind(kind)
+    if self:cur().kind == kind then
+        return self:take()
+    end
+    return nil
+end
+
+function Parser:expectKind(kind)
+    local cur = self:cur()
+    if cur.kind ~= kind then
+        self:addDiag("PARSE-BLK-009", "ERROR", string.format("Expected %s, got '%s' (%s)", kind, tostring(cur.value), cur.kind), cur.line, cur.col)
+        return nil
+    end
+    return self:take()
+end
+
 local OPERATOR_PRECEDENCE = {
     ["or"] = 1,
     ["and"] = 2,
@@ -537,31 +595,60 @@ local OPERATOR_PRECEDENCE = {
     ["^"] = 8
 }
 
+-- Decode escape sequences in a quoted string literal (raw text incl. quotes)
+local function decodeStringLiteral(raw)
+    local inner = raw
+    if (inner:sub(1,1) == '"' or inner:sub(1,1) == "'") then
+        inner = inner:sub(2, -2)
+    end
+    local out = {}
+    local j = 1
+    local n = #inner
+    while j <= n do
+        local ch = inner:sub(j, j)
+        if ch == "\\" and j < n then
+            local nx = inner:sub(j + 1, j + 1)
+            if nx == "n" then table.insert(out, "\n")
+            elseif nx == "t" then table.insert(out, "\t")
+            elseif nx == "r" then table.insert(out, "\r")
+            elseif nx == "0" then table.insert(out, "\0")
+            elseif nx == "\\" then table.insert(out, "\\")
+            elseif nx == '"' then table.insert(out, '"')
+            elseif nx == "'" then table.insert(out, "'")
+            else table.insert(out, nx)
+            end
+            j = j + 2
+        else
+            table.insert(out, ch)
+            j = j + 1
+        end
+    end
+    return table.concat(out)
+end
+
 function Parser:primary(depth)
     depth = depth or 0
     if depth > CONFIG.MAX_EXPRESSION_DEPTH then
         self:addDiag("PARSE-DEP-002", "ERROR", "Max expression nesting depth exceeded", self:cur().line, self:cur().col)
         return { tag = "number", value = 0, line = self:cur().line, col = self:cur().col }
     end
-    
+
     self.nodeCount = self.nodeCount + 1
     if self.nodeCount > CONFIG.MAX_AST_NODES then
         error("[Hyperion Parser] Maximum AST node limit exceeded (" .. CONFIG.MAX_AST_NODES .. ")", 0)
     end
-    
+
     local cur = self:cur()
-    
+
     -- Number literal
     if cur.kind == "NUMBER" then
         self:take()
         return { tag = "number", value = tonumber(cur.value) or 0, line = cur.line, col = cur.col }
-        
-    -- String literal
+
+    -- String literal (escape sequences decoded)
     elseif cur.kind == "STRING" then
         self:take()
-        local raw = cur.value
-        local clean = (raw:sub(1,1) == '"' or raw:sub(1,1) == "'") and raw:sub(2, -2) or raw
-        return { tag = "string", value = clean, line = cur.line, col = cur.col }
+        return { tag = "string", value = decodeStringLiteral(cur.value), line = cur.line, col = cur.col }
 
     -- Boolean literal (true / false)
     elseif cur.kind == "BOOL_LIT" then
@@ -573,12 +660,12 @@ function Parser:primary(depth)
     elseif cur.kind == "NIL_LIT" then
         self:take()
         return { tag = "nil", value = nil, line = cur.line, col = cur.col }
-        
+
     -- Identifier / Function Call / Member Access
     elseif cur.kind == "IDENT" then
         self:take()
         local node = { tag = "ident", name = cur.value, line = cur.line, col = cur.col }
-        
+
         while true do
             if self:match("(") then
                 local args = {}
@@ -604,20 +691,20 @@ function Parser:primary(depth)
             end
         end
         return node
-        
+
     -- Parenthesized expression
     elseif self:match("(") then
         local inner = self:expr(0, depth + 1)
         self:expect(")")
         return inner
-        
+
     -- Unary operators (-x, not x)
     elseif cur.value == "-" or cur.value == "not" or cur.value == "!" then
         local op = self:take().value
         local operand = self:primary(depth + 1)
         return { tag = "unary", op = op, operand = operand, line = cur.line, col = cur.col }
     end
-    
+
     self:addDiag("PARSE-EXP-004", "ERROR", "Expected valid expression, got '" .. cur.value .. "'", cur.line, cur.col)
     self:take()
     return { tag = "ident", name = "<error>", line = cur.line, col = cur.col }
@@ -627,19 +714,43 @@ function Parser:expr(minPrec, depth)
     minPrec = minPrec or 0
     depth = depth or 0
     local left = self:primary(depth)
-    
+
     while true do
         local cur = self:cur()
         local op = cur.value
         local prec = OPERATOR_PRECEDENCE[op]
         if not prec or prec < minPrec then break end
-        
+
         self:take()
         local nextMin = (op == "^") and prec or (prec + 1)
         local right = self:expr(nextMin, depth + 1)
         left = { tag = "binary", op = op, left = left, right = right, line = cur.line, col = cur.col }
     end
     return left
+end
+
+-- Parse a statement block. Languages with braces of keywords (Lua/EPL) end at
+-- stopValues; Python blocks end at DEDENT.
+function Parser:parseBlock(stopValues)
+    local body = {}
+    while true do
+        local cur = self:cur()
+        while cur.kind == "NEWLINE" do
+            self:take()
+            cur = self:cur()
+        end
+        if cur.kind == "EOF" or cur.kind == "DEDENT" then break end
+        if stopValues then
+            local hit = false
+            for _, v in ipairs(stopValues) do
+                if cur.value == v then hit = true break end
+            end
+            if hit then break end
+        end
+        local s = self:parseStatement()
+        if s then table.insert(body, s) else break end
+    end
+    return body
 end
 
 -- Statement Parsing with support for EPL, Lua, and Python
@@ -675,11 +786,7 @@ function Parser:parseStatement()
             end
         end
         self:expect(")")
-        local body = {}
-        while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
-            local s = self:parseStatement()
-            if s then table.insert(body, s) else break end
-        end
+        local body = self:parseBlock({"end"})
         self:expect("end")
         return { tag = "function", name = fnName, params = params, body = body, isLocal = true, line = cur.line, col = cur.col }
     end
@@ -702,14 +809,55 @@ function Parser:parseStatement()
         self:expect(")")
         self:expect(":")
         while self:cur().kind == "NEWLINE" do self:take() end
-        self:expect("INDENT")
-        local body = {}
-        while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
-            local s = self:parseStatement()
-            if s then table.insert(body, s) else break end
-        end
-        self:match("DEDENT")
+        self:expectKind("INDENT")
+        local body = self:parseBlock(nil)
+        self:matchKind("DEDENT")
         return { tag = "function", name = fnName, params = params, body = body, isLocal = false, line = cur.line, col = cur.col }
+    end
+
+    -- Numeric for-loop:
+    --   Lua/EPL:  for i = start, limit [, step] do ... end
+    --   EPL:      for <count> times do ... end
+    if cur.value == "for" then
+        local forToken = self:take()
+
+        if self.lang == "Python" then
+            self:addDiag("PARSE-FOR-008", "ERROR", "Python-style 'for ... in range(...)' is not supported; use a while loop", cur.line, cur.col)
+            return nil
+        end
+
+        local varName, startE
+        if self:cur().kind == "IDENT" and self:peek(1).value == "=" then
+            varName = self:take().value
+            self:take() -- eat '='
+            startE = self:expr(0)
+        else
+            -- "for <count> times do" desugars to a hidden 1..count counter
+            local countE = self:expr(0)
+            if self:cur().value == "times" then
+                self:take()
+            else
+                self:addDiag("PARSE-FOR-007", "ERROR", "Expected '=' after loop variable or 'times' after count", self:cur().line, self:cur().col)
+            end
+            varName = "$forcount_" .. forToken.line .. "_" .. forToken.col
+            startE = { tag = "number", value = 1, line = forToken.line, col = forToken.col }
+            local body = nil
+            self:expect("do")
+            body = self:parseBlock({"end"})
+            self:expect("end")
+            return { tag = "for", var = varName, start = startE, limit = countE, step = nil, body = body, hidden = true, line = forToken.line, col = forToken.col }
+        end
+
+        self:expect(",")
+        local limitE = self:expr(0)
+        local stepE = nil
+        if self:match(",") then
+            stepE = self:expr(0)
+        end
+        self:expect("do")
+        local body = self:parseBlock({"end"})
+        self:expect("end")
+        return { tag = "for", var = varName, start = startE, limit = limitE, step = stepE, body = body, line = forToken.line, col = forToken.col }
     end
 
     -- EPL / Lua variable declaration
@@ -730,11 +878,25 @@ function Parser:parseStatement()
         return { tag = "set", name = id.value, expr = val, isLocal = (cur.value == "local"), line = cur.line, col = cur.col }
     end
 
-    -- Print / Calculate statement
+    -- Print / Calculate statement (multi-argument print(...) supported)
     if cur.value == "print" or cur.value == "calculate" then
         local isCalc = (cur.value == "calculate")
         self:take()
         local hasParen = self:match("(")
+        if hasParen and not isCalc then
+            local args = {}
+            if self:cur().value ~= ")" then
+                table.insert(args, self:expr(0))
+                while self:match(",") do
+                    table.insert(args, self:expr(0))
+                end
+            end
+            self:expect(")")
+            if #args == 1 then
+                return { tag = "print", expr = args[1], line = cur.line, col = cur.col }
+            end
+            return { tag = "print", args = args, line = cur.line, col = cur.col }
+        end
         local e = self:expr(0)
         if hasParen then self:expect(")") end
         return { tag = isCalc and "calculate" or "print", expr = e, line = cur.line, col = cur.col }
@@ -757,62 +919,93 @@ function Parser:parseStatement()
         if self.lang == "Python" then
             self:expect(":")
             while self:cur().kind == "NEWLINE" do self:take() end
-            self:expect("INDENT")
-            while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
-                local stmt = self:parseStatement()
-                if stmt then table.insert(body, stmt) else break end
-            end
-            self:match("DEDENT")
+            self:expectKind("INDENT")
+            body = self:parseBlock(nil)
+            self:matchKind("DEDENT")
         else
             self:expect("do")
-            while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
-                local stmt = self:parseStatement()
-                if stmt then table.insert(body, stmt) else break end
-            end
+            body = self:parseBlock({"end"})
             self:expect("end")
         end
         return { tag = "while", cond = cond, body = body, line = whileToken.line, col = whileToken.col }
     end
 
-    -- If statement
+    -- If statement (Python supports elif chains)
     if cur.value == "if" then
         self:take()
         local cond = self:expr(0)
         if self.lang == "Python" then
             self:expect(":")
             while self:cur().kind == "NEWLINE" do self:take() end
-            self:expect("INDENT")
-            local thenBody = {}
-            while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
-                local s = self:parseStatement()
-                if s then table.insert(thenBody, s) else break end
-            end
-            self:match("DEDENT")
+            self:expectKind("INDENT")
+            local thenBody = self:parseBlock(nil)
+            self:matchKind("DEDENT")
             local elseBody = {}
+            -- elif chain: each elif becomes a nested if node in elseBody
+            while self:cur().value == "elif" do
+                local elifTok = self:take()
+                local elifCond = self:expr(0)
+                self:expect(":")
+                while self:cur().kind == "NEWLINE" do self:take() end
+                self:expectKind("INDENT")
+                local elifBody = self:parseBlock(nil)
+                self:matchKind("DEDENT")
+                elseBody = { { tag = "if", cond = elifCond, thenBody = elifBody, elseBody = {}, line = elifTok.line, col = elifTok.col } }
+                -- attach deeper elif/else into the nested node
+                local anchor = elseBody[1]
+                while self:cur().value == "elif" do
+                    local tok2 = self:take()
+                    local c2 = self:expr(0)
+                    self:expect(":")
+                    while self:cur().kind == "NEWLINE" do self:take() end
+                    self:expectKind("INDENT")
+                    local b2 = self:parseBlock(nil)
+                    self:matchKind("DEDENT")
+                    anchor.elseBody = { { tag = "if", cond = c2, thenBody = b2, elseBody = {}, line = tok2.line, col = tok2.col } }
+                    anchor = anchor.elseBody[1]
+                end
+                if self:match("else") then
+                    self:expect(":")
+                    while self:cur().kind == "NEWLINE" do self:take() end
+                    self:expectKind("INDENT")
+                    anchor.elseBody = self:parseBlock(nil)
+                    self:matchKind("DEDENT")
+                end
+                return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = cur.line, col = cur.col }
+            end
             if self:match("else") then
                 self:expect(":")
                 while self:cur().kind == "NEWLINE" do self:take() end
-                self:expect("INDENT")
-                while self:cur().kind ~= "EOF" and self:cur().kind ~= "DEDENT" do
-                    local s = self:parseStatement()
-                    if s then table.insert(elseBody, s) else break end
-                end
-                self:match("DEDENT")
+                self:expectKind("INDENT")
+                elseBody = self:parseBlock(nil)
+                self:matchKind("DEDENT")
             end
             return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = cur.line, col = cur.col }
         else
             self:expect("then")
-            local thenBody = {}
-            while self:cur().kind ~= "EOF" and self:cur().value ~= "else" and self:cur().value ~= "elseif" and self:cur().value ~= "end" do
-                local s = self:parseStatement()
-                if s then table.insert(thenBody, s) else break end
-            end
+            local thenBody = self:parseBlock({"else", "elseif", "end"})
             local elseBody = {}
             if self:match("else") then
-                while self:cur().kind ~= "EOF" and self:cur().value ~= "end" do
-                    local s = self:parseStatement()
-                    if s then table.insert(elseBody, s) else break end
+                elseBody = self:parseBlock({"end"})
+            elseif self:cur().value == "elseif" then
+                local elseifTok = self:take()
+                local elseifCond = self:expr(0)
+                self:expect("then")
+                local elseifBody = self:parseBlock({"else", "elseif", "end"})
+                local nested = { tag = "if", cond = elseifCond, thenBody = elseifBody, elseBody = {}, line = elseifTok.line, col = elseifTok.col }
+                local anchor = nested
+                while self:cur().value == "elseif" do
+                    local tok2 = self:take()
+                    local c2 = self:expr(0)
+                    self:expect("then")
+                    local b2 = self:parseBlock({"else", "elseif", "end"})
+                    anchor.elseBody = { { tag = "if", cond = c2, thenBody = b2, elseBody = {}, line = tok2.line, col = tok2.col } }
+                    anchor = anchor.elseBody[1]
                 end
+                if self:match("else") then
+                    anchor.elseBody = self:parseBlock({"end"})
+                end
+                elseBody = { nested }
             end
             self:expect("end")
             return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = cur.line, col = cur.col }
@@ -849,19 +1042,25 @@ end
 
 function Parser:parse()
     local ast = { tag = "program", body = {}, lang = self.lang, nodeCount = 0 }
-    
+
     while self:cur().kind ~= "EOF" do
         self.nodeCount = self.nodeCount + 1
         if self.nodeCount > CONFIG.MAX_AST_NODES then
             error("[Hyperion Parser] AST node limit exceeded (" .. CONFIG.MAX_AST_NODES .. ")", 0)
         end
-        
+
+        local before = self.pos
         local stmt = self:parseStatement()
         if stmt then
             table.insert(ast.body, stmt)
         end
+        -- Progress guarantee: a statement handler that consumes nothing would
+        -- otherwise loop forever (e.g. on stray structural tokens).
+        if self.pos == before then
+            self:take()
+        end
     end
-    
+
     ast.nodeCount = self.nodeCount
     return ast, self.diagnostics
 end
@@ -874,15 +1073,15 @@ local SemanticAnalyzer = {}
 function SemanticAnalyzer.analyze(ast)
     local diagnostics = {}
     local symbols = {}
-    
+
     -- Scope stack: each frame has declared { name -> {line, col, used} }
     local scopeStack = { {} }
-    
+
     local function pushScope() table.insert(scopeStack, {}) end
     local function popScope()
         local cur = table.remove(scopeStack)
         for name, info in pairs(cur) do
-            if not info.used and name:sub(1,1) ~= "_" then
+            if not info.used and name:sub(1,1) ~= "_" and name:sub(1,1) ~= "$" then
                 table.insert(diagnostics, {
                     code = "SEM-VAR-001",
                     severity = "WARNING",
@@ -894,13 +1093,13 @@ function SemanticAnalyzer.analyze(ast)
             end
         end
     end
-    
+
     local function declareVar(name, kind, line, col)
         local cur = scopeStack[#scopeStack]
         cur[name] = { line = line, col = col, used = false }
         table.insert(symbols, { name = name, kind = kind, line = line, col = col })
     end
-    
+
     local function useVar(name, line, col)
         if name == "true" or name == "false" or name == "nil" or name == "<error>" then return end
         for idx = #scopeStack, 1, -1 do
@@ -962,7 +1161,7 @@ function SemanticAnalyzer.analyze(ast)
                     col = stmt.col or 1
                 })
             end
-            
+
             if stmt.tag == "set" then
                 declareVar(stmt.name, "variable", stmt.line, stmt.col)
                 checkExpr(stmt.expr)
@@ -974,8 +1173,19 @@ function SemanticAnalyzer.analyze(ast)
                 end
                 checkStatements(stmt.body or {})
                 popScope()
+            elseif stmt.tag == "for" then
+                checkExpr(stmt.start)
+                checkExpr(stmt.limit)
+                checkExpr(stmt.step)
+                pushScope()
+                if not stmt.hidden then
+                    declareVar(stmt.var, "variable", stmt.line, stmt.col)
+                end
+                checkStatements(stmt.body or {})
+                popScope()
             elseif stmt.tag == "print" or stmt.tag == "calculate" or stmt.tag == "wait" then
                 checkExpr(stmt.expr)
+                for _, arg in ipairs(stmt.args or {}) do checkExpr(arg) end
             elseif stmt.tag == "expr_stmt" then
                 checkExpr(stmt.expr)
             elseif stmt.tag == "if" then
@@ -1004,7 +1214,7 @@ function SemanticAnalyzer.analyze(ast)
 
     checkStatements(ast.body or {})
     popScope()
-    
+
     return diagnostics, symbols
 end
 
@@ -1014,12 +1224,24 @@ end
 local validateIR
 local HyperionIR = {}
 
+-- Flatten a callee AST node (ident or member chain) to a dotted name,
+-- e.g. math.floor -> "math.floor". Returns nil if not statically resolvable.
+local function flattenCallee(node)
+    if not node then return nil end
+    if node.tag == "ident" then return node.name end
+    if node.tag == "member" then
+        local base = flattenCallee(node.object)
+        if base then return base .. "." .. node.member end
+    end
+    return nil
+end
+
 function HyperionIR.fromAST(ast)
     local instructions = {}
     local constants = {}
     local constLookup = {}
     local regCounter = 0
-    
+
     local function allocReg()
         if regCounter >= CONFIG.MAX_REGISTERS then
             error(string.format("[Hyperion IR] Register limit exceeded (%d)", CONFIG.MAX_REGISTERS), 0)
@@ -1028,7 +1250,7 @@ function HyperionIR.fromAST(ast)
         regCounter = regCounter + 1
         return r
     end
-    
+
     local function addConst(val)
         local key = type(val) .. ":" .. tostring(val)
         if not constLookup[key] then
@@ -1040,7 +1262,7 @@ function HyperionIR.fromAST(ast)
         end
         return constLookup[key]
     end
-    
+
     local function emit(op, a, b, c, loc)
         if #instructions >= CONFIG.MAX_IR_INSTRUCTIONS then
             error(string.format("[Hyperion IR] Instruction limit exceeded (%d)", CONFIG.MAX_IR_INSTRUCTIONS), 0)
@@ -1056,14 +1278,17 @@ function HyperionIR.fromAST(ast)
         })
         return #instructions - 1
     end
-    
-    local function compileExpr(node)
+
+    local compileExpr
+    local compileStatement
+
+    compileExpr = function(node)
         if not node then
             local r = allocReg()
             emit("LOADNIL", r, nil, nil, node)
             return r
         end
-        
+
         if node.tag == "number" or node.tag == "string" then
             local r = allocReg()
             local kidx = addConst(node.value)
@@ -1130,17 +1355,20 @@ function HyperionIR.fromAST(ast)
             for _, arg in ipairs(node.args or {}) do
                 table.insert(argRegs, compileExpr(arg))
             end
-            local calleeName = node.callee.name or "func"
+            local calleeName = flattenCallee(node.callee)
+            if not calleeName then
+                error("[Hyperion IR] Unsupported dynamic call target at line " .. tostring(node.line), 0)
+            end
             emit("CALL", rDst, calleeName, table.concat(argRegs, ","), node)
             return rDst
         end
-        
+
         local fallback = allocReg()
         emit("LOADNIL", fallback, nil, nil, node)
         return fallback
     end
-    
-    local function compileStatement(stmt)
+
+    compileStatement = function(stmt)
         if stmt.tag == "set" then
             if stmt.isLocal then
                 emit("DECLARE_LOCAL", stmt.name, nil, nil, stmt)
@@ -1154,9 +1382,66 @@ function HyperionIR.fromAST(ast)
             emit("RETURN", "nil", nil, nil, stmt)
             instructions[jmpOver + 1].a = #instructions
             emit("DEF_FN", stmt.name, fnStart, table.concat(stmt.params or {}, ","), stmt)
+        elseif stmt.tag == "for" then
+            -- Desugared numeric for-loop with runtime step-sign handling:
+            --   var = start; $limit = limit; $step = step or 1
+            --   loop: cond = ($step >= 0) ? (var <= $limit) : (var >= $limit)
+            --   if not cond: exit
+            --   body; var = var + $step; goto loop
+            local uid = tostring(stmt.line) .. "_" .. tostring(stmt.col)
+            local limitName = "$forlimit_" .. uid
+            local stepName = "$forstep_" .. uid
+
+            emit("DECLARE_LOCAL", stmt.var, nil, nil, stmt)
+            local rStart = compileExpr(stmt.start)
+            emit("STORE", stmt.var, rStart, nil, stmt)
+            local rLimit = compileExpr(stmt.limit)
+            emit("STORE", limitName, rLimit, nil, stmt)
+            local rStep
+            if stmt.step then
+                rStep = compileExpr(stmt.step)
+            else
+                rStep = compileExpr({ tag = "number", value = 1, line = stmt.line, col = stmt.col })
+            end
+            emit("STORE", stepName, rStep, nil, stmt)
+
+            local loopStart = #instructions
+            local rI = allocReg(); emit("LOAD", rI, stmt.var, nil, stmt)
+            local rS = allocReg(); emit("LOAD", rS, stepName, nil, stmt)
+            local rZ = allocReg(); local kz = addConst(0); emit("LOADK", rZ, "0", "K" .. kz, stmt)
+            local rPos = allocReg(); emit("GE", rPos, rS, rZ, stmt)
+            local rCond = allocReg()
+            local jmpToNeg = emit("JMPNOT", rPos, -1, nil, stmt)
+            -- positive step: var <= limit
+            local rL1 = allocReg(); emit("LOAD", rL1, limitName, nil, stmt)
+            emit("LE", rCond, rI, rL1, stmt)
+            local jmpAfterCond = emit("JMP", -1, nil, nil, stmt)
+            -- negative step: var >= limit
+            local negStart = #instructions
+            instructions[jmpToNeg + 1].b = negStart
+            local rL2 = allocReg(); emit("LOAD", rL2, limitName, nil, stmt)
+            emit("GE", rCond, rI, rL2, stmt)
+            local condDone = #instructions
+            instructions[jmpAfterCond + 1].a = condDone
+
+            local exitJump = emit("JMPNOT", rCond, -1, nil, stmt)
+            for _, s in ipairs(stmt.body or {}) do compileStatement(s) end
+            local rI2 = allocReg(); emit("LOAD", rI2, stmt.var, nil, stmt)
+            local rS2 = allocReg(); emit("LOAD", rS2, stepName, nil, stmt)
+            local rN = allocReg(); emit("ADD", rN, rI2, rS2, stmt)
+            emit("STORE", stmt.var, rN, nil, stmt)
+            emit("JMP", loopStart, nil, nil, stmt)
+            instructions[exitJump + 1].b = #instructions
         elseif stmt.tag == "print" or stmt.tag == "calculate" then
-            local rVal = compileExpr(stmt.expr)
-            emit("PRINT", rVal, nil, nil, stmt)
+            if stmt.args then
+                for _, arg in ipairs(stmt.args) do
+                    local rVal = compileExpr(arg)
+                    emit("PRINT", rVal, nil, nil, stmt)
+                end
+            else
+                local rVal = compileExpr(stmt.expr)
+                emit("PRINT", rVal, nil, nil, stmt)
+            end
         elseif stmt.tag == "wait" then
             local rSec = compileExpr(stmt.expr)
             emit("WAIT", rSec, nil, nil, stmt)
@@ -1173,7 +1458,7 @@ function HyperionIR.fromAST(ast)
             local rCond = compileExpr(stmt.cond)
             local jmpIfIdx = emit("JMPNOT", rCond, -1, nil, stmt)
             for _, s in ipairs(stmt.thenBody or {}) do compileStatement(s) end
-            
+
             if stmt.elseBody and #stmt.elseBody > 0 then
                 local jmpElseEnd = emit("JMP", -1, nil, nil, stmt)
                 instructions[jmpIfIdx + 1].b = #instructions
@@ -1187,13 +1472,13 @@ function HyperionIR.fromAST(ast)
             emit("RETURN", rRet, nil, nil, stmt)
         end
     end
-    
+
     for _, s in ipairs(ast.body or {}) do
         compileStatement(s)
     end
-    
+
     emit("RETURN", "nil", nil, nil, { line = 1, col = 1 })
-    
+
     return {
         instructions = instructions,
         constants = constants,
@@ -1207,7 +1492,7 @@ function HyperionIR.disassemble(irData)
         string.format("; Registers: %d | Constants: %d | Instructions: %d", irData.regCount, #irData.constants, #irData.instructions),
         ""
     }
-    
+
     for _, inst in ipairs(irData.instructions) do
         local opStr = string.format("%04d  %-8s %-6s", inst.idx, inst.op, tostring(inst.a or ""))
         if inst.b then opStr = opStr .. " " .. tostring(inst.b) end
@@ -1215,7 +1500,7 @@ function HyperionIR.disassemble(irData)
         opStr = string.format("%-32s ; L%d:C%d", opStr, inst.line, inst.col)
         table.insert(lines, opStr)
     end
-    
+
     return table.concat(lines, "\n")
 end
 
@@ -1226,7 +1511,7 @@ local Optimizer = {}
 
 function Optimizer.optimizeAST(node)
     if not node or type(node) ~= "table" then return node end
-    
+
     if node.tag == "program" then
         local newBody = {}
         for _, s in ipairs(node.body or {}) do
@@ -1237,7 +1522,7 @@ function Optimizer.optimizeAST(node)
     elseif node.tag == "binary" then
         node.left = Optimizer.optimizeAST(node.left)
         node.right = Optimizer.optimizeAST(node.right)
-        
+
         -- Constant Folding: numbers
         if node.left.tag == "number" and node.right.tag == "number" then
             local a, b = node.left.value, node.right.value
@@ -1254,22 +1539,55 @@ function Optimizer.optimizeAST(node)
         if node.op == ".." and node.left.tag == "string" and node.right.tag == "string" then
             return { tag = "string", value = node.left.value .. node.right.value, line = node.line, col = node.col }
         end
-        
-        -- Safe Algebraic Simplification (x + 0 => x, x * 1 => x) only for pure identifier/number
+
+        -- Safe Algebraic Simplification (x + 0 => x, x * 1 => x).
+        -- Only applied when the surviving operand is a pure number literal:
+        -- folding away "+ 0" for strings would hide real type errors.
         if node.op == "+" then
-            if node.right.tag == "number" and node.right.value == 0 then return node.left end
-            if node.left.tag == "number" and node.left.value == 0 then return node.right end
+            if node.right.tag == "number" and node.right.value == 0 and node.left.tag == "number" then return node.left end
+            if node.left.tag == "number" and node.left.value == 0 and node.right.tag == "number" then return node.right end
         elseif node.op == "*" then
-            if node.right.tag == "number" and node.right.value == 1 then return node.left end
-            if node.left.tag == "number" and node.left.value == 1 then return node.right end
+            if node.right.tag == "number" and node.right.value == 1 and node.left.tag == "number" then return node.left end
+            if node.left.tag == "number" and node.left.value == 1 and node.right.tag == "number" then return node.right end
         end
-        
+
         return node
     elseif node.tag == "set" or node.tag == "print" or node.tag == "calculate" or node.tag == "wait" then
         node.expr = Optimizer.optimizeAST(node.expr)
+        if node.args then
+            local newArgs = {}
+            for _, a in ipairs(node.args) do table.insert(newArgs, Optimizer.optimizeAST(a)) end
+            node.args = newArgs
+        end
+        return node
+    elseif node.tag == "for" then
+        node.start = Optimizer.optimizeAST(node.start)
+        node.limit = Optimizer.optimizeAST(node.limit)
+        node.step = Optimizer.optimizeAST(node.step)
+        local newBody = {}
+        for _, s in ipairs(node.body or {}) do table.insert(newBody, Optimizer.optimizeAST(s)) end
+        node.body = newBody
+        return node
+    elseif node.tag == "while" or node.tag == "if" then
+        node.cond = Optimizer.optimizeAST(node.cond)
+        if node.body then
+            local nb = {}
+            for _, s in ipairs(node.body) do table.insert(nb, Optimizer.optimizeAST(s)) end
+            node.body = nb
+        end
+        if node.thenBody then
+            local nb = {}
+            for _, s in ipairs(node.thenBody) do table.insert(nb, Optimizer.optimizeAST(s)) end
+            node.thenBody = nb
+        end
+        if node.elseBody then
+            local nb = {}
+            for _, s in ipairs(node.elseBody) do table.insert(nb, Optimizer.optimizeAST(s)) end
+            node.elseBody = nb
+        end
         return node
     end
-    
+
     return node
 end
 
@@ -1281,11 +1599,11 @@ function Optimizer.optimizeIR(irData)
     for _, inst in ipairs(irData.instructions) do
         table.insert(optimized, inst)
     end
-    
+
     for i, inst in ipairs(optimized) do
         inst.idx = i - 1
     end
-    
+
     local afterCount = #optimized
     local reduction = beforeCount > 0 and math.floor(((beforeCount - afterCount) / beforeCount) * 100) or 0
     local validOutput, outputError = validateIR({
@@ -1294,7 +1612,7 @@ function Optimizer.optimizeIR(irData)
         regCount = irData.regCount
     })
     if not validOutput then error("[Hyperion Optimizer] Produced invalid IR: " .. tostring(outputError), 0) end
-    
+
     return {
         instructions = optimized,
         constants = irData.constants,
@@ -1319,7 +1637,9 @@ local function emitExprLua(n)
     elseif n.tag == "bool" then return tostring(n.value)
     elseif n.tag == "nil" then return "nil"
     elseif n.tag == "ident" then return n.name
-    elseif n.tag == "unary" then return "(" .. n.op .. " " .. emitExprLua(n.operand) .. ")"
+    elseif n.tag == "unary" then
+        local op = (n.op == "!") and "not" or n.op
+        return "(" .. op .. " " .. emitExprLua(n.operand) .. ")"
     elseif n.tag == "binary" then return "(" .. emitExprLua(n.left) .. " " .. n.op .. " " .. emitExprLua(n.right) .. ")"
     elseif n.tag == "call" then
         local args = {}
@@ -1368,6 +1688,15 @@ function TargetGen.toLuau(ast)
             elseif stmt.tag == "set" then
                 local prefix = stmt.isLocal and "local " or ""
                 table.insert(lines, indent .. string.format("%s%s = %s", prefix, stmt.name, emitExprLua(stmt.expr)))
+            elseif stmt.tag == "for" then
+                if stmt.hidden then
+                    table.insert(lines, indent .. "for _ = 1, " .. emitExprLua(stmt.limit) .. " do")
+                else
+                    local stepPart = stmt.step and (", " .. emitExprLua(stmt.step)) or ""
+                    table.insert(lines, indent .. string.format("for %s = %s, %s%s do", stmt.var, emitExprLua(stmt.start), emitExprLua(stmt.limit), stepPart))
+                end
+                emitStmts(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
             elseif stmt.tag == "while" then
                 table.insert(lines, indent .. "while " .. emitExprLua(stmt.cond) .. " do")
                 emitStmts(stmt.body or {}, indent .. "    ")
@@ -1376,16 +1705,30 @@ function TargetGen.toLuau(ast)
                 table.insert(lines, indent .. string.format("local function %s(%s)", stmt.name, table.concat(stmt.params or {}, ", ")))
                 emitStmts(stmt.body or {}, indent .. "    ")
                 table.insert(lines, indent .. "end")
-            elseif stmt.tag == "print" then table.insert(lines, indent .. string.format("print(%s)", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "print" then
+                if stmt.args then
+                    local parts = {}
+                    for _, a in ipairs(stmt.args) do table.insert(parts, emitExprLua(a)) end
+                    table.insert(lines, indent .. string.format("print(%s)", table.concat(parts, ", ")))
+                else
+                    table.insert(lines, indent .. string.format("print(%s)", emitExprLua(stmt.expr)))
+                end
             elseif stmt.tag == "calculate" then table.insert(lines, indent .. string.format("print(%s)", emitExprLua(stmt.expr)))
             elseif stmt.tag == "wait" then table.insert(lines, indent .. string.format("task.wait(%s)", emitExprLua(stmt.expr)))
             elseif stmt.tag == "expr_stmt" then table.insert(lines, indent .. emitExprLua(stmt.expr))
             elseif stmt.tag == "if" then
                 table.insert(lines, indent .. string.format("if %s then", emitExprLua(stmt.cond)))
                 emitStmts(stmt.thenBody or {}, indent .. "    ")
-                if stmt.elseBody and #stmt.elseBody > 0 then
+                -- Collapse nested single-if elseBody into elseif for readability
+                local elseB = stmt.elseBody or {}
+                while #elseB == 1 and elseB[1].tag == "if" do
+                    table.insert(lines, indent .. string.format("elseif %s then", emitExprLua(elseB[1].cond)))
+                    emitStmts(elseB[1].thenBody or {}, indent .. "    ")
+                    elseB = elseB[1].elseBody or {}
+                end
+                if #elseB > 0 then
                     table.insert(lines, indent .. "else")
-                    emitStmts(stmt.elseBody, indent .. "    ")
+                    emitStmts(elseB, indent .. "    ")
                 end
                 table.insert(lines, indent .. "end")
             elseif stmt.tag == "return" then
@@ -1409,6 +1752,14 @@ function TargetGen.toPython(ast)
             if stmt.tag == "comment" then table.insert(lines, indent .. "# " .. stmt.value:gsub("^%-%-", ""))
             elseif stmt.tag == "set" then
                 table.insert(lines, indent .. string.format("%s = %s", stmt.name, emitExprPython(stmt.expr)))
+            elseif stmt.tag == "for" then
+                if stmt.hidden then
+                    table.insert(lines, indent .. "for _ in range(" .. emitExprPython(stmt.limit) .. "):")
+                else
+                    local stepPart = stmt.step and (", " .. emitExprPython(stmt.step)) or ""
+                    table.insert(lines, indent .. string.format("for %s in range(%s, (%s) + 1%s):", stmt.var, emitExprPython(stmt.start), emitExprPython(stmt.limit), stepPart))
+                end
+                emitStmts(stmt.body or {}, indent .. "    ")
             elseif stmt.tag == "while" then
                 table.insert(lines, indent .. "while " .. emitExprPython(stmt.cond) .. ":")
                 emitStmts(stmt.body or {}, indent .. "    ")
@@ -1416,7 +1767,13 @@ function TargetGen.toPython(ast)
                 table.insert(lines, indent .. string.format("def %s(%s):", stmt.name, table.concat(stmt.params or {}, ", ")))
                 emitStmts(stmt.body or {}, indent .. "    ")
             elseif stmt.tag == "print" or stmt.tag == "calculate" then
-                table.insert(lines, indent .. string.format("print(%s)", emitExprPython(stmt.expr)))
+                if stmt.args then
+                    local parts = {}
+                    for _, a in ipairs(stmt.args) do table.insert(parts, emitExprPython(a)) end
+                    table.insert(lines, indent .. string.format("print(%s)", table.concat(parts, ", ")))
+                else
+                    table.insert(lines, indent .. string.format("print(%s)", emitExprPython(stmt.expr)))
+                end
             elseif stmt.tag == "wait" then
                 table.insert(lines, indent .. string.format("time.sleep(%s)", emitExprPython(stmt.expr)))
             elseif stmt.tag == "expr_stmt" then
@@ -1424,9 +1781,15 @@ function TargetGen.toPython(ast)
             elseif stmt.tag == "if" then
                 table.insert(lines, indent .. string.format("if %s:", emitExprPython(stmt.cond)))
                 emitStmts(stmt.thenBody or {}, indent .. "    ")
-                if stmt.elseBody and #stmt.elseBody > 0 then
+                local elseB = stmt.elseBody or {}
+                while #elseB == 1 and elseB[1].tag == "if" do
+                    table.insert(lines, indent .. string.format("elif %s:", emitExprPython(elseB[1].cond)))
+                    emitStmts(elseB[1].thenBody or {}, indent .. "    ")
+                    elseB = elseB[1].elseBody or {}
+                end
+                if #elseB > 0 then
                     table.insert(lines, indent .. "else:")
-                    emitStmts(stmt.elseBody, indent .. "    ")
+                    emitStmts(elseB, indent .. "    ")
                 end
             elseif stmt.tag == "return" then
                 table.insert(lines, indent .. (stmt.expr and ("return " .. emitExprPython(stmt.expr)) or "return"))
@@ -1439,58 +1802,102 @@ end
 
 function TargetGen.toEPL(ast)
     local lines = { "-- Target: EPL" }
-    for _, stmt in ipairs(ast.body or {}) do
-        if stmt.tag == "comment" then table.insert(lines, stmt.value)
-        elseif stmt.tag == "set" then table.insert(lines, string.format("set %s = %s", stmt.name, emitExprLua(stmt.expr)))
-        elseif stmt.tag == "print" then table.insert(lines, string.format("print %s", emitExprLua(stmt.expr)))
-        elseif stmt.tag == "calculate" then table.insert(lines, string.format("calculate %s", emitExprLua(stmt.expr)))
-        elseif stmt.tag == "wait" then table.insert(lines, string.format("wait %s", emitExprLua(stmt.expr)))
-        elseif stmt.tag == "while" then
-            table.insert(lines, "while " .. emitExprLua(stmt.cond) .. " do")
-            for _, child in ipairs(stmt.body or {}) do
-                if child.tag == "print" then
-                    table.insert(lines, "    print " .. emitExprLua(child.expr))
-                elseif child.tag == "set" then
-                    table.insert(lines, "    set " .. child.name .. " = " .. emitExprLua(child.expr))
-                elseif child.tag == "wait" then
-                    table.insert(lines, "    wait " .. emitExprLua(child.expr))
+    local function emitEPL(stmts, indent)
+        indent = indent or ""
+        for _, stmt in ipairs(stmts) do
+            if stmt.tag == "comment" then table.insert(lines, indent .. stmt.value)
+            elseif stmt.tag == "set" then table.insert(lines, indent .. string.format("set %s = %s", stmt.name, emitExprLua(stmt.expr)))
+            elseif stmt.tag == "print" then
+                if stmt.args then
+                    local parts = {}
+                    for _, a in ipairs(stmt.args) do table.insert(parts, emitExprLua(a)) end
+                    table.insert(lines, indent .. string.format("print(%s)", table.concat(parts, ", ")))
+                else
+                    table.insert(lines, indent .. string.format("print %s", emitExprLua(stmt.expr)))
                 end
+            elseif stmt.tag == "calculate" then table.insert(lines, indent .. string.format("calculate %s", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "wait" then table.insert(lines, indent .. string.format("wait %s", emitExprLua(stmt.expr)))
+            elseif stmt.tag == "for" then
+                if stmt.hidden then
+                    table.insert(lines, indent .. "for " .. emitExprLua(stmt.limit) .. " times do")
+                else
+                    local stepPart = stmt.step and (", " .. emitExprLua(stmt.step)) or ""
+                    table.insert(lines, indent .. string.format("for %s = %s, %s%s do", stmt.var, emitExprLua(stmt.start), emitExprLua(stmt.limit), stepPart))
+                end
+                emitEPL(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "while" then
+                table.insert(lines, indent .. "while " .. emitExprLua(stmt.cond) .. " do")
+                emitEPL(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "if" then
+                table.insert(lines, indent .. "if " .. emitExprLua(stmt.cond) .. " then")
+                emitEPL(stmt.thenBody or {}, indent .. "    ")
+                if stmt.elseBody and #stmt.elseBody > 0 then
+                    table.insert(lines, indent .. "else")
+                    emitEPL(stmt.elseBody, indent .. "    ")
+                end
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "function" then
+                table.insert(lines, indent .. string.format("local function %s(%s)", stmt.name, table.concat(stmt.params or {}, ", ")))
+                emitEPL(stmt.body or {}, indent .. "    ")
+                table.insert(lines, indent .. "end")
+            elseif stmt.tag == "expr_stmt" then table.insert(lines, indent .. emitExprLua(stmt.expr))
+            elseif stmt.tag == "return" then
+                table.insert(lines, indent .. (stmt.expr and ("return " .. emitExprLua(stmt.expr)) or "return"))
             end
-            table.insert(lines, "end")
         end
     end
+    emitEPL(ast.body or {}, "")
     return table.concat(lines, "\n")
 end
 
 -- ============================================================================
--- 12. TRANSLATION MATRIX & CACHE
+-- 12. TRANSLATION MATRIX & CACHE (LRU-capped)
 -- ============================================================================
 local TranslationCache = {}
+local translationCacheOrder = {}
 local translationStats = { hits = 0, misses = 0 }
+
+local function cacheGet(key)
+    return TranslationCache[key]
+end
+
+local function cacheSet(key, value)
+    if not TranslationCache[key] then
+        table.insert(translationCacheOrder, key)
+    end
+    TranslationCache[key] = value
+    while #translationCacheOrder > CONFIG.MAX_CACHE_ENTRIES do
+        local oldest = table.remove(translationCacheOrder, 1)
+        TranslationCache[oldest] = nil
+    end
+end
 
 local function translateSource(src, fromLang, toLang)
     if fromLang == toLang then return src end
-    
+
     local cacheKey = hashSource(src, fromLang, toLang)
-    if TranslationCache[cacheKey] then
+    local cached = cacheGet(cacheKey)
+    if cached then
         translationStats.hits = translationStats.hits + 1
-        return TranslationCache[cacheKey]
+        return cached
     end
     translationStats.misses = translationStats.misses + 1
-    
+
     local tokens = Lexer.lex(src, fromLang)
     local parser = Parser.new(tokens, fromLang)
     local ast, diags = parser:parse()
-    
+
     for _, d in ipairs(diags) do
         if d.severity == "ERROR" then
             error(string.format("[Hyperion Translator] %s at Line %d, Col %d", d.message, d.line, d.col), 0)
         end
     end
-    
+
     local optAST = Optimizer.optimizeAST(ast)
     local result = ""
-    
+
     if toLang == "IR" then
         local irData = HyperionIR.fromAST(optAST)
         local optIR = Optimizer.optimizeIR(irData)
@@ -1504,13 +1911,13 @@ local function translateSource(src, fromLang, toLang)
     else
         error("Unsupported target translation language: " .. tostring(toLang), 0)
     end
-    
-    TranslationCache[cacheKey] = result
+
+    cacheSet(cacheKey, result)
     return result
 end
 
 -- ============================================================================
--- 13. HARDENED SANDBOXED VM (Call Frames, Scopes, Strict Watchdog)
+-- 13. HARDENED SANDBOXED VM (Call Frames, Scopes, Strict Watchdog, Debugger)
 -- ============================================================================
 local VM = {
     state = "IDLE", -- "IDLE", "RUNNING", "PAUSED", "HALTED"
@@ -1582,7 +1989,6 @@ validateIR = function(irData)
             end
             return true
         end
-        local regError
         if inst.op == "LOADK" or inst.op == "LOADBOOL" or inst.op == "LOADNIL" or inst.op == "PRINT" or inst.op == "WAIT" or inst.op == "DECLARE_LOCAL" then
             if inst.op ~= "DECLARE_LOCAL" then
                 local okReg, msg = requireReg(inst.a, "destination")
@@ -1670,7 +2076,7 @@ function VM.init(irData, customEnv)
     VM.outputBytes = 0
     VM.instructionsExecuted = 0
     VM.state = "IDLE"
-    
+
     -- Sandboxed Safe Environment
     VM.environment = {
         math = math,
@@ -1692,11 +2098,14 @@ function VM.init(irData, customEnv)
             if VM.onOutput then VM.onOutput(outStr) end
         end
     }
-    
+
     if customEnv then
         for k, v in pairs(customEnv) do VM.environment[k] = v end
     end
 end
+
+-- table.unpack on modern Luau, unpack as a legacy fallback.
+local unpackArgs = table.unpack or unpack
 
 local function isTruthy(value)
     return value ~= nil and value ~= false
@@ -1735,9 +2144,20 @@ local function setScopedValue(frame, name, value)
     VM.environment[name] = value
 end
 
+-- Resolve a dotted name like "math.floor" against the sandboxed environment.
+local function resolveDotted(env, dottedName)
+    local current = env
+    for part in dottedName:gmatch("[^%.]+") do
+        if type(current) ~= "table" then return nil end
+        current = current[part]
+        if current == nil then return nil end
+    end
+    return current
+end
+
 local function expectComparable(a, b, operation, inst)
     local ta, tb = type(a), type(b)
-    if (ta ~= "number" and ta ~= "string") or (tb ~= "number" and tb ~= "string") then
+    if (ta ~= "number" and ta ~= "string") or (tb ~= "number" and tb ~= "string") or ta ~= tb then
         VM.state = "HALTED"
         error(string.format("Runtime error at L%d:C%d: %s requires matching number or string operands, got %s and %s",
             inst.line or 1, inst.col or 1, operation, ta, tb), 0)
@@ -1768,9 +2188,9 @@ function VM.step()
         if VM.onHalt then VM.onHalt("Execution finished") end
         return false
     end
-    
+
     VM.instructionsExecuted = VM.instructionsExecuted + 1
-    
+
     if VM.instructionsExecuted > CONFIG.MAX_INSTRUCTIONS then
         VM.state = "HALTED"
         error(string.format("[Hyperion Watchdog] Instruction budget exceeded (%d ops)", CONFIG.MAX_INSTRUCTIONS), 0)
@@ -1779,17 +2199,17 @@ function VM.step()
         VM.state = "HALTED"
         error(string.format("[Hyperion Watchdog] Runtime budget exceeded (%.2f s)", CONFIG.MAX_RUNTIME_SEC), 0)
     end
-    
+
     local inst = VM.instructions[VM.pc]
     local op = inst.op
-    
+
     -- Breakpoint check
     if VM.breakpoints[inst.line] and VM.state == "RUNNING" and VM.instructionsExecuted > 1 then
         VM.state = "PAUSED"
         if VM.onPause then VM.onPause(inst.line, inst.idx) end
         return false
     end
-    
+
     -- Execute Opcodes
     if op == "LOADK" then
         local value = inst.b
@@ -1937,6 +2357,10 @@ function VM.step()
     elseif op == "CALL" then
         local fnName = inst.b
         local fnInfo = VM.functions[fnName]
+        local envFn = nil
+        if not fnInfo then
+            envFn = resolveDotted(VM.environment, fnName)
+        end
         if fnInfo then
             if type(inst.c) ~= "string" and inst.c ~= nil then
                 VM.state = "HALTED"
@@ -1986,7 +2410,7 @@ function VM.step()
             })
             VM.registers = {}
             VM.pc = fnInfo.pc + 1
-        elseif VM.environment[fnName] and type(VM.environment[fnName]) == "function" then
+        elseif envFn ~= nil and type(envFn) == "function" then
             local args = {}
             if inst.c and inst.c ~= "" then
                 for a in inst.c:gmatch("[^,]+") do
@@ -1998,7 +2422,7 @@ function VM.step()
                     table.insert(args, VM.registers[a])
                 end
             end
-            VM.registers[inst.a] = VM.environment[fnName](unpack(args))
+            VM.registers[inst.a] = envFn(unpackArgs(args))
             VM.pc = VM.pc + 1
         else
             VM.state = "HALTED"
@@ -2043,7 +2467,7 @@ function VM.step()
         VM.state = "HALTED"
         error(string.format("VM ERROR: Unsupported opcode '%s' at instruction %d", tostring(op), inst.idx), 0)
     end
-    
+
     return true
 end
 
@@ -2051,7 +2475,7 @@ function VM.runContinuous()
     VM.state = "RUNNING"
     VM.startTime = os.clock()
     VM.deadline = VM.startTime + CONFIG.MAX_RUNTIME_SEC
-    
+
     while VM.state == "RUNNING" do
         local ok, cont = pcall(VM.step)
         if not ok then
@@ -2071,6 +2495,11 @@ local Profiler = {
     timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 },
     counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
 }
+
+function Profiler.reset()
+    Profiler.timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 }
+    Profiler.counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+end
 
 local TestRunner = {}
 
@@ -2284,9 +2713,104 @@ function TestRunner.runAll()
                 end)
                 return ok and VM.state == "HALTED" and VM.lastError ~= nil
             end
+        },
+        {
+            name = "Member Function Call (math.floor)",
+            fn = function()
+                local src = "set r = math.floor(3.7)"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["r"] == 3
+            end
+        },
+        {
+            name = "Numeric For Loop",
+            fn = function()
+                local src = "set s = 0\nfor i = 1, 5 do\n    set s = s + i\nend"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["s"] == 15
+            end
+        },
+        {
+            name = "For Loop Negative Step",
+            fn = function()
+                local src = "set s = 0\nfor i = 5, 1, -1 do\n    set s = s + i\nend"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["s"] == 15
+            end
+        },
+        {
+            name = "For Times Loop",
+            fn = function()
+                local src = "set c = 0\nfor 3 times do\n    set c = c + 1\nend"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and VM.environment["c"] == 3
+            end
+        },
+        {
+            name = "Escape Sequence Decoding",
+            fn = function()
+                local toks = Lexer.lex('set s = "a\\nb"', "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                return ast.body[1].expr.value == "a\nb"
+            end
+        },
+        {
+            name = "Hex & Exponent Numbers",
+            fn = function()
+                local toks = Lexer.lex("set a = 0x10\nset b = 1e3", "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                return ast.body[1].expr.value == 16 and ast.body[2].expr.value == 1000
+            end
+        },
+        {
+            name = "Python elif Chain",
+            fn = function()
+                local py = "x = 5\nif x > 10:\n    print(1)\nelif x > 3:\n    print(2)\nelse:\n    print(3)"
+                local toks = Lexer.lex(py, "Python")
+                local p = Parser.new(toks, "Python")
+                local ast, diags = p:parse()
+                for _, d in ipairs(diags) do
+                    if d.severity == "ERROR" then return false end
+                end
+                return ast.body[2].tag == "if" and #ast.body[2].elseBody == 1 and ast.body[2].elseBody[1].tag == "if"
+            end
+        },
+        {
+            name = "Multi-Argument Print",
+            fn = function()
+                local toks = Lexer.lex('print("a", "b", 3)', "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.lastError == nil and ast.body[1].tag == "print" and ast.body[1].args ~= nil and #ast.body[1].args == 3
+            end
         }
     }
-    
+
     local passed = 0
     local results = {}
     for _, t in ipairs(tests) do
@@ -2459,7 +2983,7 @@ local sideLabel = mk("TextLabel", {
     BackgroundTransparency = 1,
     Position = UDim2.fromOffset(10, 6),
     Size = UDim2.new(1, -20, 0, 20),
-    Text = "PROJECT FILES",
+    Text = "DOCUMENTS",
     TextColor3 = C.muted,
     TextSize = 11,
     Font = Enum.Font.Code,
@@ -2468,13 +2992,17 @@ local sideLabel = mk("TextLabel", {
 
 local fileList = mk("ScrollingFrame", {
     Position = UDim2.fromOffset(6, 28),
-    Size = UDim2.new(1, -12, 1, -34),
+    Size = UDim2.new(1, -12, 1, -70),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 3,
     CanvasSize = UDim2.new()
 }, side)
 local fileLayout = mk("UIListLayout", { Padding = UDim.new(0, 3) }, fileList)
+
+local newDocBtn = button(side, "+ New Document", C.green)
+newDocBtn.Position = UDim2.new(0, 6, 1, -34)
+newDocBtn.Size = UDim2.new(1, -12, 0, 26)
 
 -- Tabs Bar
 local tabsBar = mk("Frame", {
@@ -2484,7 +3012,8 @@ local tabsBar = mk("Frame", {
 }, center)
 
 local tabsContainer = mk("ScrollingFrame", {
-    Size = UDim2.new(1, -40, 1, 0),
+    Size = UDim2.new(1, -8, 1, 0),
+    Position = UDim2.fromOffset(4, 0),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 0,
@@ -2492,7 +3021,10 @@ local tabsContainer = mk("ScrollingFrame", {
 }, tabsBar)
 local tabsLayout = mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, tabsContainer)
 
--- Editor Frame
+-- Editor Area (scrollable editor + clickable breakpoint gutter)
+local LINE_HEIGHT = math.ceil(TextService:GetTextSize("Ag", CONFIG.EDITOR_TEXT_SIZE, Enum.Font.Code, Vector2.new(1000, 1000)).Y)
+if LINE_HEIGHT < 10 then LINE_HEIGHT = 16 end
+
 local editorFrame = mk("Frame", {
     Position = UDim2.fromOffset(0, 32),
     Size = UDim2.new(1, 0, 1, -192),
@@ -2501,34 +3033,41 @@ local editorFrame = mk("Frame", {
     ClipsDescendants = true
 }, center)
 
-local gutter = mk("TextLabel", {
+local gutterScroll = mk("ScrollingFrame", {
     Position = UDim2.fromOffset(0, 0),
-    Size = UDim2.fromOffset(44, 5000),
+    Size = UDim2.new(0, 46, 1, 0),
     BackgroundColor3 = C.gutter,
     BorderSizePixel = 0,
-    Text = "1",
-    TextColor3 = C.gutterText,
-    TextSize = 13,
-    Font = Enum.Font.Code,
-    TextXAlignment = Enum.TextXAlignment.Right,
-    TextYAlignment = Enum.TextYAlignment.Top
+    ScrollBarThickness = 0,
+    ScrollingEnabled = false,
+    CanvasSize = UDim2.new()
+}, editorFrame)
+local gutterLayout = mk("UIListLayout", { Padding = UDim.new(0, 0) }, gutterScroll)
+
+local editorScroll = mk("ScrollingFrame", {
+    Position = UDim2.fromOffset(50, 0),
+    Size = UDim2.new(1, -54, 1, 0),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 4,
+    CanvasSize = UDim2.new()
 }, editorFrame)
 
 -- Editable plain TextBox
 local editor = mk("TextBox", {
-    Position = UDim2.fromOffset(50, 0),
-    Size = UDim2.new(1, -54, 5000, 0),
+    Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.new(1, 0, 1, 0),
     BackgroundTransparency = 1,
     ClearTextOnFocus = false,
     MultiLine = true,
     Text = "",
     TextColor3 = C.text,
-    TextSize = 13,
+    TextSize = CONFIG.EDITOR_TEXT_SIZE,
     Font = Enum.Font.Code,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextYAlignment = Enum.TextYAlignment.Top,
     TextWrapped = false
-}, editorFrame)
+}, editorScroll)
 editor.TextEditable = true
 
 -- Separate rich syntax overlay label (avoids focused XML tag corruption)
@@ -2538,61 +3077,56 @@ local syntaxOverlay = mk("TextLabel", {
     BackgroundTransparency = 1,
     Text = "",
     TextColor3 = C.text,
-    TextSize = 13,
+    TextSize = CONFIG.EDITOR_TEXT_SIZE,
     Font = Enum.Font.Code,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextYAlignment = Enum.TextYAlignment.Top,
     TextWrapped = false,
     RichText = true,
     Visible = false
-}, editorFrame)
+}, editorScroll)
 
-editor.Focused:Connect(function()
-    syntaxOverlay.Visible = false
-    editor.TextTransparency = 0
-end)
-
-editor.FocusLost:Connect(function()
-    syntaxOverlay.Visible = true
-    editor.TextTransparency = 1
-end)
-
--- Toolbar
+-- Toolbar (horizontally scrollable)
 local toolbar = mk("Frame", {
     Position = UDim2.new(0, 0, 1, -160),
     Size = UDim2.new(1, 0, 0, 36),
     BackgroundColor3 = C.panel,
-    BorderSizePixel = 0
+    BorderSizePixel = 0,
+    ClipsDescendants = true
 }, center)
 
-local runBtn = button(toolbar, "▶ Run", C.green)
-runBtn.Position = UDim2.fromOffset(6, 4)
-runBtn.Size = UDim2.fromOffset(64, 26)
+local toolbarScroll = mk("ScrollingFrame", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 0,
+    ScrollingDirection = Enum.ScrollingDirection.X,
+    CanvasSize = UDim2.new()
+}, toolbar)
+local toolbarLayout = mk("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5) }, toolbarScroll)
+mk("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingTop = UDim.new(0, 5) }, toolbarScroll)
 
-local transBtn = button(toolbar, "Translate", C.blue)
-transBtn.Position = UDim2.fromOffset(74, 4)
-transBtn.Size = UDim2.fromOffset(78, 26)
+local function toolBtn(text, col, width)
+    local b = button(toolbarScroll, text, col)
+    b.Size = UDim2.fromOffset(width or 70, 26)
+    return b
+end
 
-local optBtn = button(toolbar, "Optimize", C.yellow)
-optBtn.Position = UDim2.fromOffset(156, 4)
-optBtn.Size = UDim2.fromOffset(74, 26)
+local runBtn    = toolBtn("▶ Run", C.green, 64)
+local stepBtn   = toolBtn("Step", C.cyan, 54)
+local contBtn   = toolBtn("Cont", C.cyan, 54)
+local inspBtn   = toolBtn("Inspect", C.purple, 70)
+local transBtn  = toolBtn("Translate", C.blue, 78)
+local optBtn    = toolBtn("Optimize", C.yellow, 74)
+local langBtn   = toolBtn("Src: EPL", C.text, 84)
+local targetBtn = toolBtn("Target: Luau", C.text, 100)
+local testBtn   = toolBtn("Tests", C.cyan, 60)
+local clearBtn  = toolBtn("Clear", C.muted, 56)
+local errorsBtn = toolBtn("Errors", C.red, 64)
 
-local targetBtn = button(toolbar, "Target: Luau", C.text)
-targetBtn.Position = UDim2.fromOffset(234, 4)
-targetBtn.Size = UDim2.fromOffset(100, 26)
-
-local testBtn = button(toolbar, "Tests", C.cyan)
-testBtn.Position = UDim2.fromOffset(338, 4)
-testBtn.Size = UDim2.fromOffset(60, 26)
-
-local clearBtn = button(toolbar, "Clear", C.muted)
-clearBtn.Position = UDim2.fromOffset(402, 4)
-clearBtn.Size = UDim2.fromOffset(56, 26)
-
--- GUI Diagnostics button
-local errorsBtn = button(toolbar, "Errors", C.red)
-errorsBtn.Position = UDim2.fromOffset(464, 4)
-errorsBtn.Size = UDim2.fromOffset(64, 26)
+toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
+end)
 
 -- Terminal & Output Dock
 local terminal = mk("Frame", {
@@ -2638,7 +3172,8 @@ end
 
 -- Developer Console note: Roblox does not expose the /console history as a
 -- readable client API. This viewer therefore records Hyperion-owned failures
--- at their source instead of pretending to scrape Roblox's console.\n-- Hyperion-owned console diagnostics. User-program execution output is kept
+-- at their source instead of pretending to scrape Roblox's console.
+-- Hyperion-owned console diagnostics. User-program execution output is kept
 -- in the normal terminal and is never mixed into this list.
 local function addConsoleError(message, source)
     table.insert(consoleErrors, {
@@ -2826,7 +3361,6 @@ local function reportHyperionError(message, source)
     log("[Console Error] " .. tostring(source or "Hyperion") .. ": " .. safeErrorText(message))
 end
 
-
 -- ============================================================================
 -- 15.5. MAJOR UI VISUAL REVAMP
 -- ============================================================================
@@ -2932,15 +3466,13 @@ local function applyMajorUIRevamp()
     hyperionCorner(statusBar, 7)
     hyperionStroke(statusBar, C.border, 0.5, 1)
 
-    gutter.BackgroundColor3 = C.gutter
-    gutter.BackgroundTransparency = 0.08
-    hyperionStroke(gutter, C.border, 0.72, 1)
+    gutterScroll.BackgroundColor3 = C.gutter
 
     -- Editor typography.
     editor.Font = Enum.Font.Code
-    editor.TextSize = 14
+    editor.TextSize = CONFIG.EDITOR_TEXT_SIZE
     syntaxOverlay.Font = Enum.Font.Code
-    syntaxOverlay.TextSize = 14
+    syntaxOverlay.TextSize = CONFIG.EDITOR_TEXT_SIZE
     title.Font = Enum.Font.GothamBold
     title.TextSize = 16
     statusLabel.Font = Enum.Font.GothamMedium
@@ -2955,6 +3487,9 @@ local function applyMajorUIRevamp()
     end
 
     styleHyperionButton(runBtn, C.green)
+    styleHyperionButton(stepBtn, C.cyan)
+    styleHyperionButton(contBtn, C.cyan)
+    styleHyperionButton(inspBtn, C.purple)
     styleHyperionButton(transBtn, C.blue)
     styleHyperionButton(optBtn, C.yellow)
     styleHyperionButton(testBtn, C.cyan)
@@ -2979,26 +3514,299 @@ end
 applyMajorUIRevamp()
 
 -- ============================================================================
--- 16. BUTTON ACTION WIRING & UI ACTION SAFETY
+-- 16. DOCUMENTS, TABS & EDITOR INFRASTRUCTURE
 -- ============================================================================
-local currentLanguage = "EPL"
+local sourceLanguages = { "EPL", "Lua", "Python" }
+local sourceLangIndex = 1
 local targetLanguages = { "Luau", "Lua", "Python", "EPL", "IR" }
 local targetIndex = 1
 
+local docs = {}
+local currentDoc = 1
+local debugSessionActive = false
+
+local function docLang()
+    return docs[currentDoc] and docs[currentDoc].lang or "EPL"
+end
+
+local function countLines(text)
+    return 1 + select(2, text:gsub("\n", "\n"))
+end
+
+-- Forward declarations
+local buildGutter
+local rebuildHighlight
+local rebuildTabs
+local rebuildFileList
+local updateStatusBar
+
+local function markDirty()
+    if docs[currentDoc] then
+        docs[currentDoc].text = editor.Text
+    end
+    debugSessionActive = false
+end
+
+local function newDoc(name, text, lang)
+    if #docs >= CONFIG.MAX_DOCUMENTS then
+        log("Document limit reached (" .. CONFIG.MAX_DOCUMENTS .. ").")
+        return nil
+    end
+    local d = { name = name, text = text or "", lang = lang or "EPL", bps = {} }
+    table.insert(docs, d)
+    return d
+end
+
+local function loadDocIntoEditor(i)
+    local d = docs[i]
+    if not d then return end
+    editor.Text = d.text
+    syntaxOverlay.Text = ""
+    sourceLangIndex = table.find(sourceLanguages, d.lang) or 1
+    langBtn.Text = "Src: " .. d.lang
+    buildGutter()
+    rebuildHighlight()
+    updateStatusBar()
+end
+
+local function switchDoc(i)
+    if i == currentDoc or not docs[i] then return end
+    markDirty()
+    currentDoc = i
+    loadDocIntoEditor(i)
+    rebuildTabs()
+    rebuildFileList()
+end
+
+local function closeDoc(i)
+    if #docs <= 1 then
+        log("Cannot close the last document.")
+        return
+    end
+    table.remove(docs, i)
+    if currentDoc > #docs then currentDoc = #docs end
+    if currentDoc >= i and currentDoc > 1 then currentDoc = currentDoc - 1 end
+    loadDocIntoEditor(currentDoc)
+    rebuildTabs()
+    rebuildFileList()
+end
+
+-- ============================================================================
+-- 17. GUTTER (line numbers + click-to-toggle breakpoints)
+-- ============================================================================
+local function gutterButtonText(ln)
+    local d = docs[currentDoc]
+    if d and d.bps[ln] then
+        return "● " .. ln
+    end
+    return tostring(ln)
+end
+
+buildGutter = function()
+    for _, child in ipairs(gutterScroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    local lines = countLines(editor.Text)
+    local capped = math.min(lines, CONFIG.MAX_GUTTER_LINES)
+    for ln = 1, capped do
+        local gb = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, LINE_HEIGHT),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = gutterButtonText(ln),
+            TextColor3 = (docs[currentDoc] and docs[currentDoc].bps[ln]) and C.red or C.gutterText,
+            TextSize = 11,
+            Font = Enum.Font.Code,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            AutoButtonColor = false,
+            LayoutOrder = ln
+        }, gutterScroll)
+        gb.Activated:Connect(function()
+            local d = docs[currentDoc]
+            if not d then return end
+            if d.bps[ln] then d.bps[ln] = nil else d.bps[ln] = true end
+            buildGutter()
+            if d.bps[ln] then
+                log("Breakpoint set at line " .. ln .. ".")
+            else
+                log("Breakpoint removed at line " .. ln .. ".")
+            end
+        end)
+    end
+    gutterScroll.CanvasSize = UDim2.new(0, 0, 0, lines * LINE_HEIGHT + 8)
+
+    -- Resize editor textbox so the scroll canvas matches the content
+    local viewH = editorScroll.AbsoluteWindowSize.Y
+    local contentH = math.max(lines * LINE_HEIGHT + 8, viewH)
+    local longest = 0
+    for line in (editor.Text .. "\n"):gmatch("([^\n]*)\n") do
+        if #line > longest then longest = #line end
+    end
+    local contentW = math.max(longest * math.ceil(CONFIG.EDITOR_TEXT_SIZE * 0.62) + 40, editorScroll.AbsoluteWindowSize.X)
+    editor.Size = UDim2.new(0, contentW, 0, contentH)
+    syntaxOverlay.Size = editor.Size
+    editorScroll.CanvasSize = UDim2.new(0, contentW, 0, contentH)
+end
+
+editorScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    gutterScroll.CanvasPosition = Vector2.new(0, editorScroll.CanvasPosition.Y)
+end)
+
+-- ============================================================================
+-- 18. SYNTAX HIGHLIGHTING (debounced, token-accurate via the real Lexer)
+-- ============================================================================
+local function richEscape(s)
+    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local TOKEN_HEX = {
+    KEYWORD = "KEYWORD", STRING = "STRING", NUMBER = "NUMBER",
+    BOOL_LIT = "NUMBER", NIL_LIT = "NUMBER",
+    COMMENT = "COMMENT", OP = "OP", ERROR = "ERROR", IDENT = "IDENT"
+}
+
+rebuildHighlight = function()
+    local src = editor.Text
+    if #src == 0 then
+        syntaxOverlay.Text = ""
+        return
+    end
+    local ok, tokens = pcall(Lexer.lex, src, docLang())
+    if not ok then
+        syntaxOverlay.Text = richEscape(src)
+        return
+    end
+
+    -- Map (line, col) to absolute offsets
+    local lineStarts = { 1 }
+    local pos = 1
+    while true do
+        local nl = src:find("\n", pos, true)
+        if not nl then break end
+        table.insert(lineStarts, nl + 1)
+        pos = nl + 1
+    end
+
+    local parts = {}
+    local cursor = 1
+    local srcLen = #src
+    for _, t in ipairs(tokens) do
+        if t.kind == "EOF" then break end
+        if t.kind ~= "NEWLINE" and t.kind ~= "INDENT" and t.kind ~= "DEDENT" then
+            local start = (lineStarts[t.line] or srcLen + 1) + (t.col or 1) - 1
+            if start > srcLen + 1 then break end
+            if start >= cursor then
+                if start > cursor then
+                    table.insert(parts, richEscape(src:sub(cursor, start - 1)))
+                end
+                local raw = src:sub(start, start + #t.value - 1)
+                local hexKey = TOKEN_HEX[t.kind] or "IDENT"
+                table.insert(parts, '<font color="' .. C.hex[hexKey] .. '">' .. richEscape(raw) .. "</font>")
+                cursor = start + #raw
+            end
+        end
+    end
+    if cursor <= srcLen then
+        table.insert(parts, richEscape(src:sub(cursor)))
+    end
+    syntaxOverlay.Text = table.concat(parts)
+end
+
+local highlightToken = 0
+local function scheduleHighlight()
+    highlightToken = highlightToken + 1
+    local myToken = highlightToken
+    task.delay(CONFIG.DEBOUNCE_DELAY_SEC, function()
+        if myToken == highlightToken then
+            rebuildHighlight()
+        end
+    end)
+end
+
+-- ============================================================================
+-- 19. TABS & FILE LIST
+-- ============================================================================
+rebuildTabs = function()
+    for _, child in ipairs(tabsContainer:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("Frame") then child:Destroy() end
+    end
+    for i, d in ipairs(docs) do
+        local tab = mk("Frame", {
+            Size = UDim2.new(0, math.max(70, #d.name * 8 + 34), 0, 24),
+            BackgroundColor3 = (i == currentDoc) and C.selection or C.panel,
+            BorderSizePixel = 0,
+            LayoutOrder = i
+        }, tabsContainer)
+        corner(tab, 5)
+        local tabBtn = mk("TextButton", {
+            Size = UDim2.new(1, -20, 1, 0),
+            BackgroundTransparency = 1,
+            Text = d.name,
+            TextColor3 = (i == currentDoc) and C.text or C.muted,
+            TextSize = 11,
+            Font = Enum.Font.Code,
+            AutoButtonColor = false
+        }, tab)
+        tabBtn.Activated:Connect(function() switchDoc(i) end)
+        local closeB = mk("TextButton", {
+            Position = UDim2.new(1, -18, 0, 2),
+            Size = UDim2.fromOffset(16, 20),
+            BackgroundTransparency = 1,
+            Text = "×",
+            TextColor3 = C.muted,
+            TextSize = 12,
+            Font = Enum.Font.Code,
+            AutoButtonColor = false
+        }, tab)
+        closeB.Activated:Connect(function() closeDoc(i) end)
+    end
+    tabsContainer.CanvasSize = UDim2.new(0, tabsLayout.AbsoluteContentSize.X + 8, 0, 0)
+end
+
+tabsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    tabsContainer.CanvasSize = UDim2.new(0, tabsLayout.AbsoluteContentSize.X + 8, 0, 0)
+end)
+
+rebuildFileList = function()
+    for _, child in ipairs(fileList:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    for i, d in ipairs(docs) do
+        local fb = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 22),
+            BackgroundColor3 = (i == currentDoc) and C.selection or C.panel2,
+            BorderSizePixel = 0,
+            Text = "  " .. d.name .. "  [" .. d.lang .. "]",
+            TextColor3 = (i == currentDoc) and C.text or C.muted,
+            TextSize = 11,
+            Font = Enum.Font.Code,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            AutoButtonColor = false,
+            LayoutOrder = i
+        }, fileList)
+        corner(fb, 4)
+        fb.Activated:Connect(function() switchDoc(i) end)
+    end
+    fileList.CanvasSize = UDim2.new(0, 0, 0, fileLayout.AbsoluteContentSize.Y + 4)
+end
+
+-- ============================================================================
+-- 20. BUTTON ACTION WIRING & UI ACTION SAFETY
+-- ============================================================================
 local function countErrors(diags)
     local n = 0
     for _, d in ipairs(diags or {}) do
-        if d.severity == "ERROR" then n += 1 end
+        if d.severity == "ERROR" then n = n + 1 end
     end
     return n
 end
 
 local function showDiagnostics(diags)
     local errors = countErrors(diags)
+    for _, d in ipairs(diags or {}) do
+        log(string.format("[%s] %s:%s:%s - %s", d.severity or "ERROR", d.stage or "Compiler", d.line or 1, d.col or 1, d.message or "Unknown diagnostic"))
+    end
     if errors > 0 then
-        for _, d in ipairs(diags or {}) do
-            log(string.format("[%s] %s:%s:%s - %s", d.severity or "ERROR", d.stage or "Compiler", d.line or 1, d.col or 1, d.message or "Unknown diagnostic"))
-        end
         statusLabel.Text = string.format("%d compiler error%s", errors, errors == 1 and "" or "s")
         return false
     end
@@ -3012,12 +3820,18 @@ local function parseEditorSource()
         log("Nothing to compile.")
         return nil
     end
-    local ok, tokensOrErr = pcall(Lexer.lex, source, currentLanguage)
+    Profiler.reset()
+    local lang = docLang()
+
+    local t0 = os.clock()
+    local ok, tokensOrErr = pcall(Lexer.lex, source, lang)
+    Profiler.timings.lex = os.clock() - t0
     if not ok then
         log("[Lexer] " .. safeErrorText(tokensOrErr))
         statusLabel.Text = "Lexer error"
         return nil
     end
+    Profiler.counts.tokens = #tokensOrErr
     for _, token in ipairs(tokensOrErr) do
         if token.kind == "ERROR" then
             log(string.format("[Lexer] %s:%s - %s", token.line or 1, token.col or 1, tostring(token.value)))
@@ -3025,15 +3839,50 @@ local function parseEditorSource()
             return nil
         end
     end
-    local parser = Parser.new(tokensOrErr, currentLanguage)
+
+    local parser = Parser.new(tokensOrErr, lang)
+    t0 = os.clock()
     local okParse, ast, diags = pcall(function() return parser:parse() end)
+    Profiler.timings.parse = os.clock() - t0
     if not okParse then
         log("[Parser] " .. safeErrorText(ast))
         statusLabel.Text = "Parser error"
         return nil
     end
+    Profiler.counts.astNodes = ast.nodeCount or 0
+
+    -- Semantic analysis pass (undefined vars, unused vars, unreachable code)
+    t0 = os.clock()
+    local okSem, semDiags = pcall(SemanticAnalyzer.analyze, ast)
+    Profiler.timings.semantic = os.clock() - t0
+    if okSem and semDiags then
+        for _, d in ipairs(semDiags) do
+            table.insert(diags, d)
+        end
+    end
+
     if not showDiagnostics(diags) then return nil end
     return ast
+end
+
+updateStatusBar = function(extra)
+    local pos = editor.CursorPosition
+    local ln, col = 1, 1
+    if pos and pos > 0 then
+        local before = editor.Text:sub(1, pos - 1)
+        ln = 1 + select(2, before:gsub("\n", "\n"))
+        local lastNl = 0
+        while true do
+            local p = before:find("\n", lastNl + 1, true)
+            if p then lastNl = p else break end
+        end
+        col = pos - lastNl
+    end
+    local t = Profiler.timings
+    statusLabel.Text = string.format("%s  |  Ln %d, Col %d  |  %s → %s  |  Lex %.0fms Parse %.0fms Sem %.0fms%s",
+        extra or "Ready", ln, col, docLang(), targetLanguages[targetIndex],
+        t.lex * 1000, t.parse * 1000, t.semantic * 1000,
+        VM.state ~= "IDLE" and ("  |  VM: " .. VM.state) or "")
 end
 
 local function refreshTheme()
@@ -3047,8 +3896,7 @@ local function refreshTheme()
     tabsBar.BackgroundColor3 = C.panel2
     terminal.BackgroundColor3 = Color3.fromRGB(11, 12, 15)
     editorFrame.BackgroundColor3 = C.bg
-    gutter.BackgroundColor3 = C.gutter
-    gutter.TextColor3 = C.gutterText
+    gutterScroll.BackgroundColor3 = C.gutter
     editor.TextColor3 = C.text
     syntaxOverlay.TextColor3 = C.text
     title.TextColor3 = C.text
@@ -3071,14 +3919,22 @@ local function refreshTheme()
     themeBtn.TextColor3 = C.text
     shareBtn.TextColor3 = C.green
     runBtn.TextColor3 = C.green
+    stepBtn.TextColor3 = C.cyan
+    contBtn.TextColor3 = C.cyan
+    inspBtn.TextColor3 = C.purple
     transBtn.TextColor3 = C.blue
     optBtn.TextColor3 = C.yellow
     targetBtn.TextColor3 = C.text
+    langBtn.TextColor3 = C.text
     testBtn.TextColor3 = C.cyan
     clearBtn.TextColor3 = C.muted
     errorsBtn.TextColor3 = C.red
-    statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. currentLanguage .. " → " .. targetLanguages[targetIndex]
+    statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
+    rebuildTabs()
+    rebuildFileList()
+    buildGutter()
+    rebuildHighlight()
 end
 
 local function safeAction(name, callback)
@@ -3095,40 +3951,236 @@ local function safeAction(name, callback)
     end
 end
 
+-- ============================================================================
+-- 21. DEBUGGER (Step / Continue / Breakpoints / Inspector)
+-- ============================================================================
+local inspectorPanel = mk("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -8, 0, 70),
+    Size = UDim2.new(0, 300, 0, 320),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 40
+}, root)
+corner(inspectorPanel, 8)
+stroke(inspectorPanel, C.purple)
+
+local inspTitle = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 6),
+    Size = UDim2.new(1, -20, 0, 20),
+    Text = "DEBUGGER INSPECTOR",
+    TextColor3 = C.purple,
+    TextSize = 12,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 41
+}, inspectorPanel)
+
+local inspBody = mk("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(10, 30),
+    Size = UDim2.new(1, -20, 1, -40),
+    Text = "No active debug session.",
+    TextColor3 = C.text,
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = false,
+    ZIndex = 41
+}, inspectorPanel)
+
+local function updateInspector()
+    if not inspectorPanel.Visible then return end
+    local lines = {
+        string.format("State: %s   PC: %s   Ops: %d", VM.state, tostring(VM.pc), VM.instructionsExecuted),
+        string.format("Call stack depth: %d", #VM.callStack),
+        ""
+    }
+    if #VM.callStack > 0 then
+        table.insert(lines, "-- Call Stack --")
+        for i = #VM.callStack, math.max(1, #VM.callStack - 5), -1 do
+            table.insert(lines, "  " .. tostring(VM.callStack[i].name or "?"))
+        end
+        table.insert(lines, "")
+    end
+    table.insert(lines, "-- Registers --")
+    local shown = 0
+    for name, value in pairs(VM.registers) do
+        if value ~= nil and shown < CONFIG.MAX_INSPECTOR_REGS then
+            local vs = tostring(value)
+            if #vs > 36 then vs = vs:sub(1, 36) .. "…" end
+            table.insert(lines, string.format("  %-6s = %s", name, vs))
+            shown = shown + 1
+        end
+    end
+    if shown == 0 then table.insert(lines, "  (empty)") end
+    table.insert(lines, "")
+    table.insert(lines, "-- Environment --")
+    local envShown = 0
+    for name, value in pairs(VM.environment) do
+        if type(value) ~= "function" and type(value) ~= "table" and envShown < 20 then
+            local vs = tostring(value)
+            if #vs > 30 then vs = vs:sub(1, 30) .. "…" end
+            table.insert(lines, string.format("  %s = %s", name, vs))
+            envShown = envShown + 1
+        end
+    end
+    if envShown == 0 then table.insert(lines, "  (none)") end
+    inspBody.Text = table.concat(lines, "\n")
+end
+
+local function wireVMCallbacks()
+    VM.onOutput = function(s) log(s) end
+    VM.onHalt = function(msg)
+        log("[VM] " .. tostring(msg))
+        debugSessionActive = false
+        updateInspector()
+    end
+    VM.onPause = function(line)
+        log("[Debugger] Paused at line " .. tostring(line) .. ".")
+        updateInspector()
+    end
+end
+
+local function compileForRun()
+    local ast = parseEditorSource()
+    if not ast then return nil end
+    local t0 = os.clock()
+    local ir = HyperionIR.fromAST(ast)
+    Profiler.timings.ir = os.clock() - t0
+    Profiler.counts.irInstructions = #ir.instructions
+    return ir
+end
+
+local function applyDocBreakpoints()
+    local d = docs[currentDoc]
+    VM.breakpoints = {}
+    if d then
+        for ln in pairs(d.bps) do VM.breakpoints[ln] = true end
+    end
+end
+
+local function startDebugSession()
+    local ir = compileForRun()
+    if not ir then return false end
+    VM.init(ir)
+    wireVMCallbacks()
+    applyDocBreakpoints()
+    debugSessionActive = true
+    return true
+end
+
+local function endDebugSessionIfDone()
+    if VM.state == "HALTED" then
+        debugSessionActive = false
+        updateStatusBar("Run finished: HALTED")
+    end
+    updateInspector()
+end
+
+-- ============================================================================
+-- 22. SHARE PANEL (Export & Import)
+-- ============================================================================
 local sharePanel
-local shareBox
 local function openSharePanel()
     if sharePanel then sharePanel:Destroy() end
     sharePanel = mk("Frame", {
         AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.new(0.82, 0, 0.62, 0), BackgroundColor3 = C.panel,
+        Size = UDim2.new(0.82, 0, 0.66, 0), BackgroundColor3 = C.panel,
         BorderSizePixel = 0, ZIndex = 60
     }, root)
     corner(sharePanel, 8); stroke(sharePanel, C.green)
-    local label = mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 8),
-        Size = UDim2.new(1, -90, 0, 24), Text = "SHARE CODE", TextColor3 = C.green,
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 8),
+        Size = UDim2.new(1, -240, 0, 24), Text = "SHARE CODE", TextColor3 = C.green,
         TextSize = 13, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 61 }, sharePanel)
     local close = button(sharePanel, "Close", C.text); close.Position = UDim2.new(1, -74, 0, 8); close.Size = UDim2.fromOffset(62, 24); close.ZIndex = 62
-    shareBox = mk("TextBox", { Position = UDim2.fromOffset(10, 42), Size = UDim2.new(1, -20, 1, -52),
+    local exportTab = button(sharePanel, "Export", C.green); exportTab.Position = UDim2.new(1, -144, 0, 8); exportTab.Size = UDim2.fromOffset(62, 24); exportTab.ZIndex = 62
+    local importTab = button(sharePanel, "Import", C.blue); importTab.Position = UDim2.new(1, -214, 0, 8); importTab.Size = UDim2.fromOffset(62, 24); importTab.ZIndex = 62
+
+    local shareBox = mk("TextBox", { Position = UDim2.fromOffset(10, 42), Size = UDim2.new(1, -20, 1, -88),
         BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = "", TextColor3 = C.text,
         TextSize = 11, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
         TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, MultiLine = true,
         ClearTextOnFocus = false, TextEditable = false, ZIndex = 61 }, sharePanel)
     corner(shareBox, 5)
-    local ok, encoded = pcall(Base64.encode, editor.Text or "")
-    if ok then
-        shareBox.Text = encoded
-        shareBox:CaptureFocus()
-        shareBox.SelectionStart = 1
-        shareBox.CursorPosition = #encoded + 1
-        log("Share code generated and selected for copying.")
-    else
-        shareBox.Text = "Share generation failed: " .. safeErrorText(encoded)
-        reportHyperionError(encoded, "Share")
+
+    local actionBtn = button(sharePanel, "Load into editor", C.yellow)
+    actionBtn.Position = UDim2.new(0, 10, 1, -36)
+    actionBtn.Size = UDim2.fromOffset(150, 24)
+    actionBtn.ZIndex = 62
+    actionBtn.Visible = false
+
+    local mode = "export"
+    local confirmArmed = false
+
+    local function showExport()
+        mode = "export"
+        actionBtn.Visible = false
+        shareBox.TextEditable = false
+        local ok, encoded = pcall(Base64.encode, editor.Text or "")
+        if ok then
+            shareBox.Text = encoded
+            shareBox:CaptureFocus()
+            shareBox.SelectionStart = 1
+            shareBox.CursorPosition = #encoded + 1
+            log("Share code generated and selected for copying.")
+        else
+            shareBox.Text = "Share generation failed: " .. safeErrorText(encoded)
+            reportHyperionError(encoded, "Share")
+        end
     end
+
+    local function showImport()
+        mode = "import"
+        confirmArmed = false
+        shareBox.TextEditable = true
+        shareBox.Text = ""
+        actionBtn.Text = "Load into editor"
+        actionBtn.Visible = true
+        log("Paste a share code, then click 'Load into editor'.")
+    end
+
+    exportTab.Activated:Connect(showExport)
+    importTab.Activated:Connect(showImport)
+    actionBtn.Activated:Connect(function()
+        if mode ~= "import" then return end
+        if not confirmArmed then
+            local decoded, derr = Base64.decode(shareBox.Text)
+            if not decoded then
+                log("[Share] Import failed: " .. safeErrorText(derr))
+                reportHyperionError(derr, "Share:Import")
+                return
+            end
+            confirmArmed = true
+            actionBtn.Text = "Confirm replace?"
+            log("[Share] Code decoded (" .. #decoded .. " bytes). Click 'Confirm replace?' to load it.")
+            return
+        end
+        local decoded, derr = Base64.decode(shareBox.Text)
+        if decoded then
+            markDirty()
+            local d = newDoc("import_" .. tostring(#docs + 1) .. ".epl", decoded, "EPL")
+            if d then
+                switchDoc(#docs)
+                log("[Share] Imported into new document '" .. d.name .. "'.")
+            end
+            sharePanel:Destroy()
+            sharePanel = nil
+        else
+            log("[Share] Import failed: " .. safeErrorText(derr))
+        end
+    end)
+
     close.Activated:Connect(function() sharePanel:Destroy(); sharePanel = nil end)
+    showExport()
 end
 
+-- ============================================================================
+-- 23. BUTTON WIRING
+-- ============================================================================
 minBtn.Activated:Connect(safeAction("Minimize", function()
     root.Visible = false; openPill.Visible = true
 end))
@@ -3153,30 +4205,59 @@ shareBtn.Activated:Connect(safeAction("Share", openSharePanel))
 clearBtn.Activated:Connect(safeAction("Clear", function()
     editor.Text = ""
     syntaxOverlay.Text = ""
-    gutter.Text = "1"
+    markDirty()
+    buildGutter()
     statusLabel.Text = "Editor cleared"
     log("Editor cleared.")
+end))
+
+newDocBtn.Activated:Connect(safeAction("NewDoc", function()
+    markDirty()
+    local d = newDoc("doc_" .. tostring(#docs + 1) .. ".epl", "", "EPL")
+    if d then
+        currentDoc = #docs
+        loadDocIntoEditor(currentDoc)
+        rebuildTabs()
+        rebuildFileList()
+        log("Created document '" .. d.name .. "'.")
+    end
+end))
+
+langBtn.Activated:Connect(safeAction("SourceLang", function()
+    sourceLangIndex = (sourceLangIndex % #sourceLanguages) + 1
+    local lang = sourceLanguages[sourceLangIndex]
+    docs[currentDoc].lang = lang
+    langBtn.Text = "Src: " .. lang
+    updateStatusBar()
+    rebuildFileList()
+    rebuildHighlight()
+    log("Source language: " .. lang .. ".")
 end))
 
 targetBtn.Activated:Connect(safeAction("Target", function()
     targetIndex = (targetIndex % #targetLanguages) + 1
     targetBtn.Text = "Target: " .. targetLanguages[targetIndex]
-    statusLabel.Text = currentLanguage .. " → " .. targetLanguages[targetIndex]
+    updateStatusBar()
 end))
 
 transBtn.Activated:Connect(safeAction("Translate", function()
     local target = targetLanguages[targetIndex]
-    local result = translateSource(editor.Text or "", currentLanguage, target)
-    editor.Text = result
-    syntaxOverlay.Text = ""
-    statusLabel.Text = "Translated: " .. currentLanguage .. " → " .. target
-    log("Translation complete: " .. currentLanguage .. " → " .. target .. ".")
+    local result = translateSource(editor.Text or "", docLang(), target)
+    local outLang = (target == "Luau" or target == "Lua") and "Lua" or target
+    local d = newDoc("out_" .. target:lower() .. "_" .. tostring(#docs + 1), result, outLang == "IR" and "Lua" or outLang)
+    if d then
+        markDirty()
+        switchDoc(#docs)
+    end
+    log("Translation complete: " .. docLang() .. " → " .. target .. " (opened in new tab).")
 end))
 
 optBtn.Activated:Connect(safeAction("Optimize", function()
     local ast = parseEditorSource()
     if not ast then return end
+    local t0 = os.clock()
     local optimized = Optimizer.optimizeAST(ast)
+    Profiler.timings.optimize = os.clock() - t0
     local target = targetLanguages[targetIndex]
     local result
     if target == "IR" then
@@ -3188,20 +4269,64 @@ optBtn.Activated:Connect(safeAction("Optimize", function()
     else
         result = TargetGen.toEPL(optimized)
     end
-    editor.Text = result
-    syntaxOverlay.Text = ""
-    statusLabel.Text = "Optimized → " .. target
-    log("Optimization complete. Output regenerated as " .. target .. ".")
+    local d = newDoc("opt_" .. tostring(#docs + 1), result, (target == "Luau" or target == "IR") and "Lua" or target)
+    if d then
+        markDirty()
+        switchDoc(#docs)
+    end
+    log("Optimization complete. Output opened in new tab (" .. target .. ").")
 end))
 
 runBtn.Activated:Connect(safeAction("Run", function()
-    local ast = parseEditorSource()
-    if not ast then return end
-    local ir = HyperionIR.fromAST(ast)
-    VM.init(ir)
+    if not startDebugSession() then return end
+    local t0 = os.clock()
     VM.runContinuous()
-    statusLabel.Text = "Run finished: " .. VM.state
+    Profiler.timings.runtime = os.clock() - t0
+    updateStatusBar("Run finished: " .. VM.state)
     log("Program run finished with VM state: " .. tostring(VM.state) .. ".")
+end))
+
+stepBtn.Activated:Connect(safeAction("Step", function()
+    if not debugSessionActive then
+        if not startDebugSession() then return end
+        log("[Debugger] Session started. Stepping…")
+    end
+    -- Refresh the watchdog deadline so human think-time between steps
+    -- does not count against the execution budget.
+    VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
+    VM.state = "RUNNING"
+    local ok, cont = pcall(VM.step)
+    if not ok then
+        VM.state = "HALTED"
+        VM.lastError = tostring(cont)
+        log("[Error] " .. VM.lastError)
+        endDebugSessionIfDone()
+        return
+    end
+    if VM.state == "RUNNING" then
+        VM.state = "PAUSED"
+        local inst = VM.instructions[VM.pc]
+        if inst then
+            updateStatusBar(string.format("Paused at Ln %d (op %s)", inst.line or 1, tostring(inst.op)))
+        end
+    end
+    if not cont then endDebugSessionIfDone() end
+    updateInspector()
+end))
+
+contBtn.Activated:Connect(safeAction("Continue", function()
+    if not debugSessionActive then
+        if not startDebugSession() then return end
+    end
+    VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
+    VM.runContinuous()
+    updateStatusBar("VM: " .. VM.state)
+    endDebugSessionIfDone()
+end))
+
+inspBtn.Activated:Connect(safeAction("Inspect", function()
+    inspectorPanel.Visible = not inspectorPanel.Visible
+    if inspectorPanel.Visible then updateInspector() end
 end))
 
 testBtn.Activated:Connect(safeAction("Tests", function()
@@ -3213,12 +4338,34 @@ testBtn.Activated:Connect(safeAction("Tests", function()
     statusLabel.Text = string.format("Self-tests: %d/%d passed", passed, total)
 end))
 
--- Keep the editor visually synchronized after actions.
+-- ============================================================================
+-- 24. EDITOR EVENTS (autosave, gutter, highlight, cursor tracking)
+-- ============================================================================
+editor.Focused:Connect(function()
+    syntaxOverlay.Visible = false
+    editor.TextTransparency = 0
+end)
+
+editor.FocusLost:Connect(function()
+    markDirty()
+    rebuildHighlight()
+    syntaxOverlay.Visible = true
+    editor.TextTransparency = 1
+end)
+
 editor:GetPropertyChangedSignal("Text"):Connect(function()
     if #editor.Text > CONFIG.MAX_SOURCE_BYTES then
         editor.Text = editor.Text:sub(1, CONFIG.MAX_SOURCE_BYTES)
         log("Source truncated at " .. CONFIG.MAX_SOURCE_BYTES .. " bytes.")
     end
+    markDirty()
+    buildGutter()
+    updateStatusBar()
+    scheduleHighlight()
+end)
+
+editor:GetPropertyChangedSignal("CursorPosition"):Connect(function()
+    updateStatusBar()
 end)
 
 -- Dragging support
@@ -3239,3 +4386,12 @@ UIS.InputChanged:Connect(function(input)
         root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 end)
+
+-- ============================================================================
+-- 25. INITIALIZATION
+-- ============================================================================
+newDoc("main.epl", "-- Welcome to EPL Hyperion " .. CONFIG.VERSION .. "\n-- Click a line number to set a breakpoint, then use Step / Cont.\n\nset x = 5 + 10 * 2\nprint x\n\nfor i = 1, 3 do\n    print i\nend\n", "EPL")
+loadDocIntoEditor(1)
+rebuildTabs()
+rebuildFileList()
+log("EPL Hyperion " .. CONFIG.VERSION .. " initialized. " .. #docs .. " document(s) open.")
