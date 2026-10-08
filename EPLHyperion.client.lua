@@ -960,7 +960,7 @@ function HyperionLanguages.lexC(src, dialect)
         elseif src:sub(i, i+1):match("^(==|!=|<=|>=|&&|%|%||%->|::|%+%+|%-%-|<<|>>)$") then
             local op = src:sub(i, i+1); advance(op:sub(1,1)); advance(op:sub(2,2)); i = i + 2
             tok("OP", op, sl, sc)
-        elseif ("+-*/%^=<>!&|?:.,;()[]{}#"):find(c, 1, true) then
+        elseif ("+-*/%^=<>!&|~?:.,;()[]{}#@$"):find(c, 1, true) then
             tok("OP", c, sl, sc); advance(c); i = i + 1
         else
             tok("ERROR", c, sl, sc); advance(c); i = i + 1
@@ -1547,11 +1547,6 @@ local Lexer = {}
 
 local function createToken(kind, value, line, col)
     return { kind = kind, value = value, line = line, col = col }
-end
-
--- Returns true for languages tokenized by the built-in EPL/Lua/Python engine.
-local function isNativeLang(lang)
-    return lang == "EPL" or lang == "Lua" or lang == "Luau" or lang == "Python"
 end
 
 -- Languages handled by the embedded HyperionLanguages module.

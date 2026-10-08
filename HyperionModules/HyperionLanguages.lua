@@ -705,7 +705,7 @@ function HyperionLanguages.lexC(src, dialect)
         elseif src:sub(i, i+1):match("^(==|!=|<=|>=|&&|%|%||%->|::|%+%+|%-%-|<<|>>)$") then
             local op = src:sub(i, i+1); advance(op:sub(1,1)); advance(op:sub(2,2)); i = i + 2
             tok("OP", op, sl, sc)
-        elseif ("+-*/%^=<>!&|?:.,;()[]{}#"):find(c, 1, true) then
+        elseif ("+-*/%^=<>!&|~?:.,;()[]{}#@$"):find(c, 1, true) then
             tok("OP", c, sl, sc); advance(c); i = i + 1
         else
             tok("ERROR", c, sl, sc); advance(c); i = i + 1
