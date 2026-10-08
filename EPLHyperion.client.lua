@@ -1549,7 +1549,15 @@ do
     local module = script:FindFirstChild("HyperionLanguages")
     if module and module:IsA("ModuleScript") then
         local ok, loaded = pcall(require, module)
-        if ok and type(loaded) == "table" and type(loaded.toC) == "function" then
+        local required = { "toC", "toJava", "toEnglish", "toBytecode", "parseBytecode",
+            "parseCStyle", "preprocessEnglish", "lexC", "lexEnglish" }
+        local complete = ok and type(loaded) == "table"
+        if complete then
+            for _, fn in ipairs(required) do
+                if type(loaded[fn]) ~= "function" then complete = false break end
+            end
+        end
+        if complete then
             HyperionLanguages = loaded
         end
     end
