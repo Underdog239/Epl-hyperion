@@ -1116,8 +1116,8 @@ function HyperionLanguages.parseBytecode(text)
     local lineNo = 0
 
     local function noteReg(r)
-        if type(r) == "string" and r:match("^r%d+$") then
-            local n = tonumber(r:sub(2))
+        if type(r) == "string" then
+            local n = tonumber(r:match("^[Rr](%d+)$"))
             if n and n > maxReg then maxReg = n end
         end
     end
@@ -1168,7 +1168,8 @@ function HyperionLanguages.parseBytecode(text)
         end
     end
 
-    return { instructions = instructions, constants = constants, regCount = math.max(maxReg, 1) }
+    -- regCount is one past the highest register index seen (R0..Rmax -> max+1).
+    return { instructions = instructions, constants = constants, regCount = math.max(maxReg + 1, 1) }
 end
 
 

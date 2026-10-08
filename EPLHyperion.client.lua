@@ -1371,8 +1371,8 @@ function HyperionLanguages.parseBytecode(text)
     local lineNo = 0
 
     local function noteReg(r)
-        if type(r) == "string" and r:match("^r%d+$") then
-            local n = tonumber(r:sub(2))
+        if type(r) == "string" then
+            local n = tonumber(r:match("^[Rr](%d+)$"))
             if n and n > maxReg then maxReg = n end
         end
     end
@@ -1423,7 +1423,8 @@ function HyperionLanguages.parseBytecode(text)
         end
     end
 
-    return { instructions = instructions, constants = constants, regCount = math.max(maxReg, 1) }
+    -- regCount is one past the highest register index seen (R0..Rmax -> max+1).
+    return { instructions = instructions, constants = constants, regCount = math.max(maxReg + 1, 1) }
 end
 return HyperionLanguages
 end)()
@@ -4590,6 +4591,7 @@ local outLabel = mk("TextLabel", {
 local logs = {}
 local consoleErrors = {}
 local consolePanelOpen = false
+local logBytes = 0
 
 local function safeErrorText(value)
     local s = tostring(value)
@@ -4616,7 +4618,13 @@ end
 local function log(msg)
     local textValue = safeErrorText(msg)
     table.insert(logs, textValue)
-    if #logs > CONFIG.MAX_LOG_ENTRIES then table.remove(logs, 1) end
+    logBytes = logBytes + #textValue + 1
+    -- Enforce both the entry-count cap and the total output byte budget so a
+    -- runaway program cannot grow the terminal buffer without bound.
+    while (#logs > CONFIG.MAX_LOG_ENTRIES) or (logBytes > CONFIG.MAX_OUTPUT_BYTES and #logs > 1) do
+        local removed = table.remove(logs, 1)
+        logBytes = logBytes - (#removed + 1)
+    end
     outLabel.Text = table.concat(logs, "\n")
 end
 
@@ -5703,23 +5711,56 @@ transBtn.Activated:Connect(safeAction("Translate", function()
 end))
 
 optBtn.Activated:Connect(safeAction("Optimize", function()
+    local target = targetLanguages[targetIndex]
+
+    -- Bytecode source: optimize the assembled IR directly (no AST stage).
+    if docLang() == "Bytecode" then
+        local ir = compileForRun()
+        if not ir then return end
+        local t0 = os.clock()
+        local optIR = Optimizer.optimizeIR(ir)
+        Profiler.timings.optimize = os.clock() - t0
+        local result = (target == "IR") and HyperionIR.disassemble(optIR)
+            or HyperionLanguages.toBytecode(optIR)
+        local d = newDoc("opt_" .. tostring(#docs + 1), result, target)
+        if d then
+            markDirty()
+            switchDoc(#docs)
+        end
+        log("Optimization complete (bytecode). Output opened in new tab.")
+        return
+    end
+
     local ast = parseEditorSource()
     if not ast then return end
     local t0 = os.clock()
     local optimized = Optimizer.optimizeAST(ast)
     Profiler.timings.optimize = os.clock() - t0
-    local target = targetLanguages[targetIndex]
     local result
     if target == "IR" then
         result = HyperionIR.disassemble(Optimizer.optimizeIR(HyperionIR.fromAST(optimized)))
+    elseif target == "Bytecode" then
+        result = HyperionLanguages.toBytecode(Optimizer.optimizeIR(HyperionIR.fromAST(optimized)))
     elseif target == "Luau" or target == "Lua" then
         result = TargetGen.toLuau(optimized)
     elseif target == "Python" then
         result = TargetGen.toPython(optimized)
+    elseif target == "English" then
+        result = HyperionLanguages.toEnglish(optimized)
+    elseif target == "C" then
+        result = HyperionLanguages.toC(optimized, "C")
+    elseif target == "C+" then
+        result = HyperionLanguages.toC(optimized, "C+")
+    elseif target == "C++" then
+        result = HyperionLanguages.toC(optimized, "C++")
+    elseif target == "Java" then
+        result = HyperionLanguages.toJava(optimized)
     else
         result = TargetGen.toEPL(optimized)
     end
-    local d = newDoc("opt_" .. tostring(#docs + 1), result, (target == "Luau" or target == "IR") and "Lua" or target)
+    local outLang = target
+    if target == "Luau" or target == "IR" then outLang = "Lua" end
+    local d = newDoc("opt_" .. tostring(#docs + 1), result, outLang)
     if d then
         markDirty()
         switchDoc(#docs)
