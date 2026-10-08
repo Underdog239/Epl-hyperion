@@ -1173,4 +1173,77 @@ function HyperionLanguages.parseBytecode(text)
 end
 
 
+-- ============================================================================
+-- ENGLISH LANGUAGE LEXER (for syntax highlighting of the original source)
+-- Keeps accurate line/column positions so the editor overlay aligns.
+-- ============================================================================
+function HyperionLanguages.lexEnglish(src)
+    local toks = {}
+    local i, n = 1, #src
+    local line, col = 1, 1
+    local function adv(ch)
+        if ch == "\n" then line = line + 1; col = 1 else col = col + 1 end
+    end
+    local function push(kind, value, l, c)
+        table.insert(toks, { kind = kind, value = value, line = l, col = c })
+    end
+
+    while i <= n do
+        local c = src:sub(i, i)
+        local sl, sc = line, col
+        if c == " " or c == "\t" or c == "\r" then
+            adv(c); i = i + 1
+        elseif c == "\n" then
+            push("NEWLINE", "\n", sl, sc); adv(c); i = i + 1
+        elseif c == "#" then
+            local s = ""
+            while i <= n and src:sub(i, i) ~= "\n" do
+                s = s .. src:sub(i, i); adv(src:sub(i, i)); i = i + 1
+            end
+            push("COMMENT", s, sl, sc)
+        elseif c == '"' or c == "'" then
+            local q = c; local s = q; adv(q); i = i + 1
+            while i <= n and src:sub(i, i) ~= q and src:sub(i, i) ~= "\n" do
+                s = s .. src:sub(i, i); adv(src:sub(i, i)); i = i + 1
+            end
+            if i <= n and src:sub(i, i) == q then s = s .. q; adv(q); i = i + 1 end
+            push("STRING", s, sl, sc)
+        elseif c:match("%d") then
+            local s = ""
+            while i <= n and src:sub(i, i):match("[%d%.]") do
+                s = s .. src:sub(i, i); adv(src:sub(i, i)); i = i + 1
+            end
+            push("NUMBER", s, sl, sc)
+        elseif c:match("[%a_]") then
+            local s = ""
+            while i <= n and src:sub(i, i):match("[%w_]") do
+                s = s .. src:sub(i, i); adv(src:sub(i, i)); i = i + 1
+            end
+            local lower = s:lower()
+            if lower == "note" or lower == "comment" then
+                -- Treat a trailing "note:"/"comment:" marker as a comment.
+                local lookahead = src:sub(i, i)
+                if lookahead == ":" then
+                    local cs = s
+                    while i <= n and src:sub(i, i) ~= "\n" do
+                        cs = cs .. src:sub(i, i); adv(src:sub(i, i)); i = i + 1
+                    end
+                    push("COMMENT", cs, sl, sc)
+                else
+                    push("KEYWORD", s, sl, sc)
+                end
+            elseif HyperionLanguages.ENGLISH_KEYWORDS[lower] then
+                push("KEYWORD", s, sl, sc)
+            else
+                push("IDENT", s, sl, sc)
+            end
+        else
+            push("OP", c, sl, sc); adv(c); i = i + 1
+        end
+    end
+    push("EOF", "", line, col)
+    return toks
+end
+
+
 return HyperionLanguages
