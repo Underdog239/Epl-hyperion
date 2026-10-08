@@ -1509,10 +1509,11 @@ function Lexer.lex(src, lang)
         local ln = 1
         for lineText in (src .. "\n"):gmatch("([^\n]*)\n") do
             local trimmed = lineText:gsub("^%s+", "")
+            local leading = #lineText - #trimmed
             if trimmed == "" or trimmed:sub(1, 1) == ";" then
                 table.insert(toks, createToken("COMMENT", lineText, ln, 1))
             else
-                table.insert(toks, createToken("INSTRUCTION", trimmed, ln, 1))
+                table.insert(toks, createToken("INSTRUCTION", trimmed, ln, leading + 1))
             end
             ln = ln + 1
         end
@@ -4150,6 +4151,90 @@ function TestRunner.runAll()
                 VM.runContinuous()
                 return VM.lastError == nil and ast.body[1].tag == "print" and ast.body[1].args ~= nil and #ast.body[1].args == 3
             end
+        },
+        {
+            name = "Python for-in-range Loop",
+            fn = function()
+                local py = "for i in range(3):\n    print(i)\n"
+                local toks = Lexer.lex(py, "Python")
+                local p = Parser.new(toks, "Python")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED" and VM.environment["i"] == 3
+            end
+        },
+        {
+            name = "English Language Preprocessing & Execution",
+            fn = function()
+                local src = "define x as 5 plus 3\ndisplay x\n"
+                local toks = Lexer.lex(src, "English")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.environment["x"] == 8
+            end
+        },
+        {
+            name = "C / C++ / Java Target Generation",
+            fn = function()
+                local toks = Lexer.lex("set x = 5\nprint x", "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local c = HyperionLanguages.toC(ast, "C")
+                local cpp = HyperionLanguages.toC(ast, "C++")
+                local java = HyperionLanguages.toJava(ast)
+                return c:find("int main", 1, true) ~= nil
+                    and cpp:find("cout", 1, true) ~= nil
+                    and java:find("class HyperionProgram", 1, true) ~= nil
+            end
+        },
+        {
+            name = "C-family Source Parser",
+            fn = function()
+                local src = "int main() {\n  int x = 4;\n  printf(\"%d\", x);\n  return 0;\n}\n"
+                local ast, diags = HyperionLanguages.parseCStyle(src, "C")
+                return ast ~= nil and #ast.body > 0
+            end
+        },
+        {
+            name = "Bytecode Assemble / Disassemble Round Trip",
+            fn = function()
+                local ir = { instructions = {
+                    { idx = 0, op = "LOADK", a = "r1", b = "5", c = "K0", line = 1, col = 1 },
+                    { idx = 1, op = "PRINT", a = "r1", line = 1, col = 1 },
+                }, constants = { 5 }, regCount = 2 }
+                local text = HyperionLanguages.toBytecode(ir)
+                local back = HyperionLanguages.parseBytecode(text)
+                return #back.instructions == 2 and back.instructions[1].op == "LOADK" and back.constants[1] == 5
+            end
+        },
+        {
+            name = "Luau Source Language",
+            fn = function()
+                local toks = Lexer.lex("local a = 3\nprint a", "Luau")
+                local p = Parser.new(toks, "Luau")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.environment["a"] == 3
+            end
+        },
+        {
+            name = "Cross-Language Translation Matrix",
+            fn = function()
+                local src = "set x = 5\nprint x\n"
+                local targets = { "Luau", "Lua", "Python", "EPL", "English", "C", "C+", "C++", "Java", "Bytecode", "IR" }
+                for _, target in ipairs(targets) do
+                    local out = translateSource(src, "EPL", target)
+                    if type(out) ~= "string" or #out == 0 then return false end
+                end
+                return true
+            end
         }
     }
 
@@ -5004,7 +5089,8 @@ end
 local TOKEN_HEX = {
     KEYWORD = "KEYWORD", STRING = "STRING", NUMBER = "NUMBER",
     BOOL_LIT = "NUMBER", NIL_LIT = "NUMBER",
-    COMMENT = "COMMENT", OP = "OP", ERROR = "ERROR", IDENT = "IDENT"
+    COMMENT = "COMMENT", OP = "OP", ERROR = "ERROR", IDENT = "IDENT",
+    INSTRUCTION = "KEYWORD"
 }
 
 rebuildHighlight = function()
