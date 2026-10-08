@@ -2958,14 +2958,56 @@ end
 function Optimizer.optimizeIR(irData)
     local validInput, inputError = validateIR(irData)
     if not validInput then error("[Hyperion Optimizer] Refusing invalid IR: " .. tostring(inputError), 0) end
-    local beforeCount = #irData.instructions
-    local optimized = {}
-    for _, inst in ipairs(irData.instructions) do
-        table.insert(optimized, inst)
+    local instr = irData.instructions
+    local beforeCount = #instr
+
+    -- Collect all jump/function entry targets so we never remove an instruction
+    -- that is the destination of a control transfer.
+    local isTarget = {}
+    for i, inst in ipairs(instr) do
+        if inst.op == "JMP" then
+            isTarget[tonumber(inst.a)] = true
+        elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+            isTarget[tonumber(inst.b)] = true
+        end
     end
 
-    for i, inst in ipairs(optimized) do
-        inst.idx = i - 1
+    -- Peephole: a self-move (MOVE rX rX) is a provably safe no-op, as long as
+    -- it is not a jump target.
+    local keep = {}
+    for i, inst in ipairs(instr) do
+        local selfMove = (inst.op == "MOVE" and inst.a == inst.b)
+        keep[i] = not (selfMove and not isTarget[i - 1])
+    end
+
+    -- Map old (0-based) instruction index -> new index. Removed instructions
+    -- resolve to the next retained instruction.
+    local map = {}
+    local running = 0
+    for i = 1, #instr do
+        if keep[i] then map[i - 1] = running; running = running + 1 end
+    end
+    local total = running
+    local following = total
+    for i = #instr, 1, -1 do
+        if keep[i] then following = map[i - 1] else map[i - 1] = following end
+    end
+
+    local optimized = {}
+    for i, inst in ipairs(instr) do
+        if keep[i] then
+            local copy = {
+                idx = #optimized, op = inst.op,
+                a = inst.a, b = inst.b, c = inst.c,
+                line = inst.line, col = inst.col
+            }
+            if inst.op == "JMP" then
+                copy.a = map[tonumber(inst.a)] or inst.a
+            elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+                copy.b = map[tonumber(inst.b)] or inst.b
+            end
+            table.insert(optimized, copy)
+        end
     end
 
     local afterCount = #optimized
@@ -4304,6 +4346,23 @@ function TestRunner.runAll()
                     if type(out) ~= "string" or #out == 0 then return false end
                 end
                 return true
+            end
+        },
+        {
+            name = "IR Optimizer Removes Self-Moves",
+            fn = function()
+                local ir = {
+                    instructions = {
+                        { idx = 0, op = "LOADK", a = "R0", b = "5", c = "K0", line = 1, col = 1 },
+                        { idx = 1, op = "MOVE", a = "R0", b = "R0", line = 1, col = 1 },
+                        { idx = 2, op = "PRINT", a = "R0", line = 1, col = 1 },
+                        { idx = 3, op = "RETURN", a = "nil", line = 1, col = 1 }
+                    },
+                    constants = { 5 },
+                    regCount = 1
+                }
+                local opt = Optimizer.optimizeIR(ir)
+                return #opt.instructions == 3 and opt.stats.reduction > 0
             end
         }
     }
