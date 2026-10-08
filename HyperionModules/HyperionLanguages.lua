@@ -721,4 +721,455 @@ function HyperionLanguages.lexJava(src)
 end
 
 
+-- ============================================================================
+-- C-FAMILY PARSER (C, C+, C++, Java) -> EPL-compatible AST
+-- Supports a practical teaching subset: typed declarations, assignments,
+-- if/else (braced), while, for, functions, return, printf/cout/System.out.
+-- ============================================================================
+HyperionLanguages.C_TYPE_KEYWORDS = {
+    ["int"]=true, ["long"]=true, ["short"]=true, ["float"]=true, ["double"]=true,
+    ["char"]=true, ["bool"]=true, ["boolean"]=true, ["void"]=true, ["auto"]=true,
+    ["var"]=true, ["let"]=true, ["string"]=true, ["String"]=true, ["Object"]=true,
+    ["const"]=true, ["static"]=true, ["final"]=true, ["unsigned"]=true, ["signed"]=true,
+}
+
+function HyperionLanguages.parseCStyle(src, lang)
+    lang = lang or "C++"
+    local toks = HyperionLanguages.lexC(src, lang)
+    -- Strip whitespace-ish tokens the parser does not need.
+    local filtered = {}
+    for _, t in ipairs(toks) do
+        if t.kind ~= "NEWLINE" and t.kind ~= "COMMENT" then
+            table.insert(filtered, t)
+        end
+    end
+    local P = { toks = filtered, pos = 1, diags = {}, nodeCount = 0 }
+
+    local function cur() return P.toks[P.pos] or P.toks[#P.toks] end
+    local function peek(n) return P.toks[P.pos + (n or 1)] or P.toks[#P.toks] end
+    local function take() local t = cur(); P.pos = P.pos + 1; return t end
+    local function atVal(v) return cur().value == v end
+    local function matchVal(v) if atVal(v) then return take() end return nil end
+    local function expectVal(v)
+        if atVal(v) then return take() end
+        table.insert(P.diags, { code="CPARSE-001", severity="ERROR", stage="Parser", lang=lang,
+            message="Expected '"..v.."', got '"..tostring(cur().value).."'", line=cur().line, col=cur().col })
+        return nil
+    end
+    local function bump() if P.pos < #P.toks then P.pos = P.pos + 1 end end
+    local function count() P.nodeCount = P.nodeCount + 1 end
+
+    local parseExpr, parseBlock, parseStatement, parsePrimary, parseBinRhs
+
+    local function isTypeTok(t)
+        return t and t.kind == "KEYWORD" and HyperionLanguages.C_TYPE_KEYWORDS[t.value]
+    end
+
+    parseExpr = function()
+        local left = parsePrimary()
+        return parseBinRhs(left, 0)
+    end
+
+    parseBinRhs = function(left, minPrec)
+        local prec = {
+            ["||"]=1, ["&&"]=2,
+            ["=="]=3, ["!="]=3,
+            ["<"]=4, [">"]=4, ["<="]=4, [">="]=4,
+            ["+"]=5, ["-"]=5,
+            ["*"]=6, ["/"]=6, ["%"]=6,
+        }
+        while true do
+            local op = cur().value
+            local p = prec[op]
+            if not p or p < minPrec then break end
+            local opt = take()
+            local right = parsePrimary()
+            -- fold left-assoc
+            while true do
+                local op2 = cur().value
+                local p2 = prec[op2]
+                if not p2 or p2 <= p then break end
+                local r2 = parseBinRhs(parsePrimary(), p2)
+                right = { tag="binary", op=op2, left=right, right=r2, line=opt.line, col=opt.col }
+            end
+            local mapped = op
+            if op == "&&" then mapped = "and" elseif op == "||" then mapped = "or" end
+            left = { tag="binary", op=mapped, left=left, right=right, line=opt.line, col=opt.col }
+            count()
+        end
+        return left
+    end
+
+    local function decodeStr(raw)
+        local inner = raw
+        if inner:sub(1,1) == '"' or inner:sub(1,1) == "'" then inner = inner:sub(2, -2) end
+        local out, j, n = {}, 1, #inner
+        while j <= n do
+            local ch = inner:sub(j, j)
+            if ch == "\\" and j < n then
+                local nx = inner:sub(j + 1, j + 1)
+                if nx == "n" then table.insert(out, "\n")
+                elseif nx == "t" then table.insert(out, "\t")
+                elseif nx == "r" then table.insert(out, "\r")
+                elseif nx == "0" then table.insert(out, "\0")
+                elseif nx == "\\" then table.insert(out, "\\")
+                elseif nx == '"' then table.insert(out, '"')
+                elseif nx == "'" then table.insert(out, "'")
+                else table.insert(out, nx) end
+                j = j + 2
+            else
+                table.insert(out, ch); j = j + 1
+            end
+        end
+        return table.concat(out)
+    end
+
+    parsePrimary = function()
+        local t = cur()
+        if t.kind == "NUMBER" then
+            take()
+            local v = tonumber(t.value)
+            if v == nil and t.value:sub(1,2):lower() == "0x" then v = tonumber(t.value:sub(3), 16) end
+            count()
+            return { tag = "number", value = v or 0, line = t.line, col = t.col }
+        elseif t.kind == "STRING" then
+            take(); count()
+            return { tag = "string", value = decodeStr(t.value), line = t.line, col = t.col }
+        elseif t.kind == "BOOL_LIT" then
+            take(); count()
+            return { tag = "bool", value = (t.value == "true"), line = t.line, col = t.col }
+        elseif t.kind == "NIL_LIT" then
+            take(); count()
+            return { tag = "nil", value = nil, line = t.line, col = t.col }
+        elseif t.value == "-" or t.value == "!" then
+            local op = take().value
+            local operand = parsePrimary()
+            count()
+            return { tag = "unary", op = (op == "!" and "not" or op), operand = operand, line = t.line, col = t.col }
+        elseif t.value == "(" then
+            take()
+            local e = parseExpr()
+            expectVal(")")
+            return e
+        elseif t.kind == "IDENT" or t.kind == "KEYWORD" then
+            take()
+            local node = { tag = "ident", name = t.value, line = t.line, col = t.col }
+            while true do
+                if atVal("(") then
+                    take()
+                    local args = {}
+                    if not atVal(")") then
+                        table.insert(args, parseExpr())
+                        while matchVal(",") do table.insert(args, parseExpr()) end
+                    end
+                    expectVal(")")
+                    node = { tag = "call", callee = node, args = args, line = t.line, col = t.col }
+                elseif atVal(".") or atVal("->") or atVal("::") then
+                    take()
+                    local member = take()
+                    node = { tag = "member", object = node, member = member.value, line = t.line, col = t.col }
+                else
+                    break
+                end
+            end
+            count()
+            return node
+        end
+        -- Fallback: consume and return an error marker to guarantee progress.
+        table.insert(P.diags, { code="CPARSE-002", severity="ERROR", stage="Parser", lang=lang,
+            message="Unexpected token '"..tostring(t.value).."' in expression", line=t.line, col=t.col })
+        bump()
+        return { tag = "ident", name = "<error>", line = t.line, col = t.col }
+    end
+
+
+    parseBlock = function()
+        local body = {}
+        expectVal("{")
+        while not atVal("}") and cur().kind ~= "EOF" do
+            local before = P.pos
+            local s = parseStatement()
+            if s then table.insert(body, s) end
+            if P.pos == before then bump() end
+        end
+        expectVal("}")
+        return body
+    end
+
+    local function parsePrintStmt()
+        -- printf("fmt", args...) ; cout << a << b ; System.out.println(x)
+        local t = cur()
+        if atVal("printf") then
+            take(); expectVal("(")
+            local args = {}
+            if not atVal(")") then
+                table.insert(args, parseExpr())
+                while matchVal(",") do table.insert(args, parseExpr()) end
+            end
+            expectVal(")"); matchVal(";")
+            return { tag = "print", args = args, line = t.line, col = t.col }
+        elseif atVal("cout") then
+            take()
+            local args = {}
+            while atVal("<<") do
+                take()
+                if atVal("endl") then take() else table.insert(args, parseExpr()) end
+            end
+            matchVal(";")
+            return { tag = "print", args = args, line = t.line, col = t.col }
+        end
+        return nil
+    end
+
+    parseStatement = function()
+        local t = cur()
+
+        if atVal("{") then
+            return { tag = "block", body = parseBlock(), line = t.line, col = t.col }
+        end
+
+        if atVal("if") then
+            take(); expectVal("(")
+            local cond = parseExpr()
+            expectVal(")")
+            local thenBody = parseBlock()
+            local elseBody = {}
+            if atVal("else") then
+                take()
+                if atVal("if") then
+                    elseBody = { parseStatement() }
+                else
+                    elseBody = parseBlock()
+                end
+            end
+            count()
+            return { tag = "if", cond = cond, thenBody = thenBody, elseBody = elseBody, line = t.line, col = t.col }
+        end
+
+        if atVal("while") then
+            take(); expectVal("(")
+            local cond = parseExpr()
+            expectVal(")")
+            local body = parseBlock()
+            count()
+            return { tag = "while", cond = cond, body = body, line = t.line, col = t.col }
+        end
+
+
+        if atVal("for") then
+            take(); expectVal("(")
+            local varName, startE
+            if isTypeTok(cur()) then take() end
+            if cur().kind == "IDENT" then
+                varName = take().value
+                expectVal("=")
+                startE = parseExpr()
+            else
+                varName = "$for_"
+                startE = { tag = "number", value = 1, line = t.line, col = t.col }
+            end
+            expectVal(";")
+            local cond = parseExpr()
+            expectVal(";")
+            local stepE = nil
+            if cur().kind == "IDENT" then
+                take()
+                if atVal("++") then take()
+                elseif atVal("--") then take(); stepE = { tag = "number", value = -1, line = t.line, col = t.col }
+                elseif atVal("+=") then take(); stepE = parseExpr()
+                elseif atVal("=") then take(); take(); stepE = parseExpr()
+                end
+            end
+            expectVal(")")
+            local body = parseBlock()
+            count()
+            local limit = nil
+            if cond.tag == "binary" and (cond.op == "<=" or cond.op == "<")
+               and cond.left.tag == "ident" and cond.left.name == varName then
+                limit = cond.right
+                if cond.op == "<" then
+                    limit = { tag = "binary", op = "-", left = cond.right,
+                              right = { tag = "number", value = 1, line = t.line, col = t.col },
+                              line = t.line, col = t.col }
+                end
+            end
+            if limit then
+                return { tag = "for", var = varName, start = startE, limit = limit, step = stepE, body = body, line = t.line, col = t.col }
+            end
+            local incr = stepE or { tag = "number", value = 1, line = t.line, col = t.col }
+            table.insert(body, { tag = "set", name = varName,
+                expr = { tag = "binary", op = "+", left = { tag = "ident", name = varName, line = t.line, col = t.col },
+                         right = incr, line = t.line, col = t.col }, line = t.line, col = t.col })
+            return { tag = "while", cond = cond, body = body, line = t.line, col = t.col }
+        end
+
+        if atVal("return") then
+            take()
+            local e = nil
+            if not atVal(";") and not atVal("}") and cur().kind ~= "EOF" then e = parseExpr() end
+            matchVal(";")
+            count()
+            return { tag = "return", expr = e, line = t.line, col = t.col }
+        end
+
+        local pr = parsePrintStmt()
+        if pr then return pr end
+
+        if atVal("System") then
+            take(); matchVal("."); take(); matchVal("."); take()
+            expectVal("(")
+            local args = {}
+            if not atVal(")") then
+                table.insert(args, parseExpr())
+                while matchVal(",") do table.insert(args, parseExpr()) end
+            end
+            expectVal(")"); matchVal(";")
+            return { tag = "print", args = args, line = t.line, col = t.col }
+        end
+
+        if atVal("break") or atVal("continue") then
+            take(); matchVal(";")
+            return { tag = "comment", value = "-- " .. t.value, line = t.line, col = t.col }
+        end
+
+
+        -- Function declaration: [type] IDENT ( params ) { ... }
+        local savePos = P.pos
+        if isTypeTok(cur()) then bump() end
+        if cur().kind == "IDENT" and peek(1).value == "(" then
+            local name = take().value
+            expectVal("(")
+            local params = {}
+            if not atVal(")") then
+                if isTypeTok(cur()) then take() end
+                if cur().kind == "IDENT" then table.insert(params, take().value) end
+                while matchVal(",") do
+                    if isTypeTok(cur()) then take() end
+                    if cur().kind == "IDENT" then table.insert(params, take().value) end
+                end
+            end
+            expectVal(")")
+            local body = parseBlock()
+            count()
+            return { tag = "function", name = name, params = params, body = body, isLocal = true, line = t.line, col = t.col }
+        end
+        P.pos = savePos
+
+        -- Variable declaration with type
+        if isTypeTok(cur()) then
+            take()
+            if cur().kind == "IDENT" then
+                local name = take().value
+                local val = { tag = "nil", value = nil }
+                if matchVal("=") then val = parseExpr() end
+                matchVal(";")
+                count()
+                return { tag = "set", name = name, expr = val, isLocal = true, line = t.line, col = t.col }
+            end
+            matchVal(";")
+            return { tag = "comment", value = "-- declaration", line = t.line, col = t.col }
+        end
+
+        if cur().kind == "IDENT" and peek(1).value == "=" then
+            local name = take().value
+            take()
+            local val = parseExpr()
+            matchVal(";")
+            count()
+            return { tag = "set", name = name, expr = val, isLocal = false, line = t.line, col = t.col }
+        end
+
+        if cur().kind == "EOF" or atVal("}") then return nil end
+        local e = parseExpr()
+        matchVal(";")
+        count()
+        return { tag = "expr_stmt", expr = e, line = t.line, col = t.col }
+    end
+
+    local body = {}
+    while cur().kind ~= "EOF" do
+        local before = P.pos
+        local s = parseStatement()
+        if s then
+            if s.tag == "block" then
+                for _, inner in ipairs(s.body) do table.insert(body, inner) end
+            else
+                table.insert(body, s)
+            end
+        end
+        if P.pos == before then bump() end
+    end
+
+    return { tag = "program", body = body, lang = lang, nodeCount = P.nodeCount }, P.diags
+end
+
+
+-- ============================================================================
+-- BYTECODE ASSEMBLER
+-- Parses the textual disassembly produced by toBytecode back into runnable IR.
+-- ============================================================================
+function HyperionLanguages.parseBytecode(text)
+    local constants = {}
+    local instructions = {}
+    local maxReg = 0
+    local section = nil
+    local lineNo = 0
+
+    local function noteReg(r)
+        if type(r) == "string" and r:match("^r%d+$") then
+            local n = tonumber(r:sub(2))
+            if n and n > maxReg then maxReg = n end
+        end
+    end
+
+    for rawLine in (text .. "\n"):gmatch("([^\n]*)\n") do
+        lineNo = lineNo + 1
+        local line = rawLine:gsub("\r", "")
+        local trimmed = line:gsub("^%s+", "")
+        if trimmed:match("^;") or trimmed == "" then
+            -- comment / blank
+        elseif trimmed == ".constants" then
+            section = "constants"
+        elseif trimmed == ".code" then
+            section = "code"
+        elseif section == "constants" then
+            local val = trimmed:match("STR%s+(.+)$")
+            if val then
+                constants[#constants + 1] = val
+            else
+                local num = trimmed:match("NUM%s+([%-%d%.eE]+)")
+                if num then constants[#constants + 1] = tonumber(num)
+                else
+                    local bool = trimmed:match("BOOL%s+(%a+)")
+                    if bool then constants[#constants + 1] = (bool == "true") end
+                end
+            end
+        elseif section == "code" then
+            local idx, rest = trimmed:match("^%[(%d+)%]%s+(.*)$")
+            if rest then
+                rest = rest:gsub(";.*$", "")
+                local parts = {}
+                for p in rest:gmatch("%S+") do parts[#parts + 1] = p end
+                local op = table.remove(parts, 1)
+                local function val(x)
+                    if x == nil or x == "_" then return nil end
+                    if x == "true" then return "true" end
+                    if x == "false" then return "false" end
+                    return x
+                end
+                local a, b, c = val(parts[1]), val(parts[2]), val(parts[3])
+                noteReg(a)
+                instructions[#instructions + 1] = {
+                    idx = tonumber(idx) or (#instructions),
+                    op = op, a = a, b = b, c = c,
+                    line = lineNo, col = 1
+                }
+            end
+        end
+    end
+
+    return { instructions = instructions, constants = constants, regCount = math.max(maxReg, 1) }
+end
+
+
 return HyperionLanguages
