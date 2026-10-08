@@ -3542,11 +3542,44 @@ function VM.init(irData, customEnv)
     VM.instructionsExecuted = 0
     VM.state = "IDLE"
 
-    -- Sandboxed Safe Environment
+    -- Sandboxed Safe Environment.
+    -- string.rep / string.format / table.concat are wrapped so a program cannot
+    -- allocate an unbounded amount of memory before the output watchdog fires.
+    local function tooLarge(result)
+        if type(result) == "string" and #result > CONFIG.MAX_OUTPUT_BYTES then
+            VM.state = "HALTED"
+            error("[Hyperion VM] Result exceeds the sandbox size limit (10 KB).", 0)
+        end
+        return result
+    end
+    local safeString = {}
+    for k, v in pairs(string) do safeString[k] = v end
+    safeString.rep = function(s, n)
+        n = tonumber(n) or 0
+        if n < 0 then error("[Hyperion VM] string.rep count must be non-negative", 0) end
+        if #tostring(s) * n > CONFIG.MAX_OUTPUT_BYTES then
+            VM.state = "HALTED"
+            error("[Hyperion VM] string.rep result would exceed the sandbox size limit.", 0)
+        end
+        return string.rep(s, n)
+    end
+    safeString.format = function(fmt, ...)
+        if type(fmt) == "string" and fmt:match("%d%d%d%d%d%d%d") then
+            VM.state = "HALTED"
+            error("[Hyperion VM] string.format width too large.", 0)
+        end
+        return tooLarge(string.format(fmt, ...))
+    end
+    local safeTable = {}
+    for k, v in pairs(table) do safeTable[k] = v end
+    safeTable.concat = function(t, sep, i, j)
+        return tooLarge(table.concat(t, sep, i, j))
+    end
+
     VM.environment = {
         math = math,
-        string = string,
-        table = table,
+        string = safeString,
+        table = safeTable,
         task = { wait = task.wait },
         tostring = tostring,
         tonumber = tonumber,
@@ -3571,6 +3604,7 @@ end
 
 -- table.unpack on modern Luau, unpack as a legacy fallback.
 local unpackArgs = table.unpack or unpack
+local packArgs = table.pack or function(...) return { n = select("#", ...), ... } end
 
 local function isTruthy(value)
     return value ~= nil and value ~= false
@@ -4374,6 +4408,19 @@ function TestRunner.runAll()
                 }
                 local opt = Optimizer.optimizeIR(ir)
                 return #opt.instructions == 3 and opt.stats.reduction > 0
+            end
+        },
+        {
+            name = "Sandbox String-Allocation Guard",
+            fn = function()
+                local src = "set s = string.rep(\"x\", 100000000)\nprint s"
+                local toks = Lexer.lex(src, "EPL")
+                local p = Parser.new(toks, "EPL")
+                local ast = p:parse()
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED"
             end
         }
     }
@@ -5513,9 +5560,9 @@ end
 
 local function safeAction(name, callback)
     return function(...)
-        local args = table.pack(...)
+        local args = packArgs(...)
         local ok, err = xpcall(function()
-            callback(table.unpack(args, 1, args.n))
+            callback(unpackArgs(args, 1, args.n))
         end, function(e)
             local message = safeErrorText(e)
             reportHyperionError(message, "UI:" .. name)

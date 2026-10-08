@@ -43,7 +43,7 @@ Hyperion is a small teaching-language (**EPL**) plus a full polyglot toolchain t
 - **Sandboxed VM** — call frames, closures, a hardened environment (math/string/table only), and a strict watchdog (1.0 s / 100k instructions, recursion and output caps).
 - **Step debugger** — click a line number to set a breakpoint, then Step / Continue, with a live inspector (registers, call stack, environment).
 - **IDE** — multi-document tabs, syntax highlighting driven by the real lexer (per language), four themes, a terminal, a Hyperion console-error viewer, and Base64 share-code export/import.
-- **Self-test suite** — 33 built-in tests (Tests button), all passing.
+- **Self-test suite** — 34 built-in tests (Tests button), all passing.
 
 ## Safety limits
 
