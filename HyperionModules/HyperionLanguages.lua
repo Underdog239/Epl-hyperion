@@ -474,6 +474,19 @@ end
 -- ============================================================================
 -- TARGET GENERATOR: BYTECODE DISASSEMBLY
 -- ============================================================================
+-- Single-line string escaping (Lua's %q emits real newlines, which would break
+-- the line-oriented disassembly format).
+function HyperionLanguages.escapeBytecodeString(s)
+    s = tostring(s)
+    s = s:gsub("\\", "\\\\")
+    s = s:gsub("\"", "\\\"")
+    s = s:gsub("\n", "\\n")
+    s = s:gsub("\t", "\\t")
+    s = s:gsub("\r", "\\r")
+    s = s:gsub(string.char(0), "\\0")
+    return s
+end
+
 function HyperionLanguages.toBytecode(ir)
     if not ir or not ir.instructions then
         return "; (empty bytecode)\n"
@@ -490,7 +503,7 @@ function HyperionLanguages.toBytecode(ir)
         table.insert(lines, ".constants")
         for i, k in ipairs(ir.constants) do
             if type(k) == "string" then
-                table.insert(lines, string.format("  [%04d]  STR   %q", i - 1, k))
+                table.insert(lines, string.format("  [%04d]  STR   \"%s\"", i - 1, HyperionLanguages.escapeBytecodeString(k)))
             elseif type(k) == "number" then
                 table.insert(lines, string.format("  [%04d]  NUM   %s", i - 1, tostring(k)))
             elseif type(k) == "boolean" then
@@ -1135,10 +1148,34 @@ function HyperionLanguages.parseBytecode(text)
         elseif section == "constants" then
             local val = trimmed:match("STR%s+(.+)$")
             if val then
+                -- Strip surrounding quotes and decode escapes so string constants
+                -- round-trip exactly through toBytecode/parseBytecode.
+                if val:sub(1, 1) == '"' and val:sub(-1) == '"' then
+                    local inner = val:sub(2, -2)
+                    local out, j, m = {}, 1, #inner
+                    while j <= m do
+                        local ch = inner:sub(j, j)
+                        if ch == "\\" and j < m then
+                            local nx = inner:sub(j + 1, j + 1)
+                            if nx == "n" then table.insert(out, "\n")
+                            elseif nx == "t" then table.insert(out, "\t")
+                            elseif nx == "r" then table.insert(out, "\r")
+                            elseif nx == "0" then table.insert(out, "\0")
+                            elseif nx == "\\" then table.insert(out, "\\")
+                            elseif nx == '"' then table.insert(out, '"')
+                            else table.insert(out, nx) end
+                            j = j + 2
+                        else
+                            table.insert(out, ch); j = j + 1
+                        end
+                    end
+                    val = table.concat(out)
+                end
                 constants[#constants + 1] = val
             else
                 local num = trimmed:match("NUM%s+([%-%d%.eE]+)")
-                if num then constants[#constants + 1] = tonumber(num)
+                if num then
+                    constants[#constants + 1] = tonumber(num)
                 else
                     local bool = trimmed:match("BOOL%s+(%a+)")
                     if bool then constants[#constants + 1] = (bool == "true") end
