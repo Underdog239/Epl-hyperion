@@ -1033,12 +1033,12 @@ function HyperionLanguages.parseCStyle(src, lang)
         return t and t.kind == "KEYWORD" and HyperionLanguages.C_TYPE_KEYWORDS[t.value]
     end
 
-    parseExpr = function()
-        local left = parsePrimary()
-        return parseBinRhs(left, 0)
+    parseExpr = function(depth)
+        local left = parsePrimary(depth or 0)
+        return parseBinRhs(left, 0, depth or 0)
     end
 
-    parseBinRhs = function(left, minPrec)
+    parseBinRhs = function(left, minPrec, depth)
         local prec = {
             ["||"]=1, ["&&"]=2,
             ["=="]=3, ["!="]=3,
@@ -1051,13 +1051,13 @@ function HyperionLanguages.parseCStyle(src, lang)
             local p = prec[op]
             if not p or p < minPrec then break end
             local opt = take()
-            local right = parsePrimary()
+            local right = parsePrimary((depth or 0) + 1)
             -- fold left-assoc
             while true do
                 local op2 = cur().value
                 local p2 = prec[op2]
                 if not p2 or p2 <= p then break end
-                local r2 = parseBinRhs(parsePrimary(), p2)
+                local r2 = parseBinRhs(parsePrimary((depth or 0) + 1), p2, (depth or 0) + 1)
                 right = { tag="binary", op=op2, left=right, right=r2, line=opt.line, col=opt.col }
             end
             local mapped = op
@@ -1092,7 +1092,14 @@ function HyperionLanguages.parseCStyle(src, lang)
         return table.concat(out)
     end
 
-    parsePrimary = function()
+    parsePrimary = function(depth)
+        depth = depth or 0
+        if depth > 200 then
+            table.insert(P.diags, { code="CPARSE-003", severity="ERROR", stage="Parser", lang=lang,
+                message="Maximum expression nesting depth exceeded", line=cur().line, col=cur().col })
+            bump()
+            return { tag = "number", value = 0, line=cur().line, col=cur().col }
+        end
         local t = cur()
         if t.kind == "NUMBER" then
             take()
@@ -1111,12 +1118,12 @@ function HyperionLanguages.parseCStyle(src, lang)
             return { tag = "nil", value = nil, line = t.line, col = t.col }
         elseif t.value == "-" or t.value == "!" then
             local op = take().value
-            local operand = parsePrimary()
+            local operand = parsePrimary(depth + 1)
             count()
             return { tag = "unary", op = (op == "!" and "not" or op), operand = operand, line = t.line, col = t.col }
         elseif t.value == "(" then
             take()
-            local e = parseExpr()
+            local e = parseExpr(depth + 1)
             expectVal(")")
             return e
         elseif t.kind == "IDENT" or t.kind == "KEYWORD" then
