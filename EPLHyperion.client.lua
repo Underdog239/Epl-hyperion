@@ -217,7 +217,11 @@ function BuiltInBase64.encode(data)
 end
 
 function BuiltInBase64.decode(data)
-    validateSharePayload(data)
+    -- Return errors instead of raising so callers can present a diagnostic.
+    if type(data) ~= "string" then return nil, "Base64 payload must be a string" end
+    if #data > CONFIG.MAX_SHARE_BYTES then
+        return nil, string.format("Base64 payload exceeds %d bytes", CONFIG.MAX_SHARE_BYTES)
+    end
     if #data % 4 ~= 0 then return nil, "Invalid Base64 length" end
     local lookup = {}
     for i = 1, #B64_CHARS do lookup[B64_CHARS:sub(i,i)] = i - 1 end
