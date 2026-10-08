@@ -1,4 +1,4 @@
--- EPL Hyperion 2.1.0 - single LocalScript
+-- EPL Hyperion 3.0.0 - single LocalScript
 -- Subtitle: Debugger & IDE Edition
 -- Place in StarterPlayer > StarterPlayerScripts
 -- Fully client-side and self-contained: no server, no remotes, no DataStore.
@@ -13,8 +13,8 @@ local player = Players.LocalPlayer
 -- 1. HARDENED CONFIGURATION & RESOURCE LIMITS
 -- ============================================================================
 local CONFIG = {
-    VERSION               = "2.1.0",
-    SUBTITLE              = "Debugger & IDE Edition",
+    VERSION               = "3.0.0",
+    SUBTITLE              = "Polyglot Compiler & IDE Edition",
     MAX_SOURCE_BYTES      = 100000,   -- 100 KB max source code
     MAX_TOKEN_COUNT       = 20000,    -- 20,000 tokens limit
     MAX_AST_NODES         = 12000,    -- 12,000 AST nodes limit
@@ -3162,8 +3162,19 @@ function TargetGen.toPython(ast)
                 if stmt.hidden then
                     table.insert(lines, indent .. "for _ in range(" .. emitExprPython(stmt.limit) .. "):")
                 else
+                    -- The IR for-loop is inclusive; convert to Python's exclusive
+                    -- range bound, adjusting direction for negative steps.
+                    local negStep = false
+                    if stmt.step then
+                        if stmt.step.tag == "number" and stmt.step.value < 0 then
+                            negStep = true
+                        elseif stmt.step.tag == "unary" and stmt.step.op == "-" then
+                            negStep = true
+                        end
+                    end
+                    local boundOp = negStep and "-" or "+"
                     local stepPart = stmt.step and (", " .. emitExprPython(stmt.step)) or ""
-                    table.insert(lines, indent .. string.format("for %s in range(%s, (%s) + 1%s):", stmt.var, emitExprPython(stmt.start), emitExprPython(stmt.limit), stepPart))
+                    table.insert(lines, indent .. string.format("for %s in range(%s, (%s) %s 1%s):", stmt.var, emitExprPython(stmt.start), emitExprPython(stmt.limit), boundOp, stepPart))
                 end
                 emitStmts(stmt.body or {}, indent .. "    ")
             elseif stmt.tag == "while" then
