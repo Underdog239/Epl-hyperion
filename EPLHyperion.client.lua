@@ -8025,34 +8025,60 @@ end
 
 extraBtns.sentinel.Activated:Connect(safeAction("Sentinel", sentinelOpen))
 
--- Background scanner: keeps watching the active document and reports when the
--- number of findings changes. It never edits anything on its own.
+-- Background autopilot: keeps watching the active document, reports the health
+-- score, and AUTOMATICALLY applies auto-safe fixes with no button press. It only
+-- ever runs while the editor is unfocused and the text is stable, and every edit
+-- still has to pass the module's hard budget guards. The original source is kept
+-- for Undo.
+local sentinelAutoEnabled = true
+local sentinelAutoKey = nil
+
+local function sentinelAutoTick()
+    if not SentinelEngine or not sentinelAutoEnabled then return end
+    if editor:IsFocused() then return end
+    local src = editor.Text or ""
+    local key = hashSource(src, docLang(), "SENTAUTO")
+    if key == sentinelAutoKey then return end
+    sentinelAutoKey = key
+
+    local patches = SentinelEngine.proposeFixes(src, docLang(), {})
+    if #patches > 0 then
+        local newSource, statsOrReason = SentinelEngine.apply(src, docLang(), patches, {
+            parseFn = function(text, lang)
+                local ok, ast = pcall(parseSourceToAST, text, lang)
+                return ok and ast ~= nil
+            end,
+        })
+        if newSource then
+            sentinelBackup[currentDoc] = src
+            editor.Text = newSource
+            markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
+            log(string.format("[Sentinel] Auto-patched %d safe fix(es): %d line(s) changed, %.1f%% retained.",
+                statsOrReason.hunks, statsOrReason.added + statsOrReason.removed, statsOrReason.retainedPercent))
+            return
+        elseif statsOrReason then
+            log("[Sentinel] Auto-patch skipped (guard tripped): " .. tostring(statsOrReason))
+        end
+    end
+    local findings = SentinelEngine.scan(src, docLang(), {})
+    if #findings ~= sentinelLastCount then
+        sentinelLastCount = #findings
+        log("[Sentinel] " .. SentinelEngine.summaryText(findings))
+    end
+end
+
 if SentinelEngine then
+    editor.FocusLost:Connect(function()
+        task.defer(function() pcall(sentinelAutoTick) end)
+    end)
     task.spawn(function()
         while root.Parent do
-            task.wait(20)
-            local ok, err = pcall(function()
-                local src = editor.Text or ""
-                local key = hashSource(src, docLang(), "SENT")
-                if key ~= sentinelLastKey then
-                    sentinelLastKey = key
-                    local findings = sentinelScan() or {}
-                    if #findings ~= sentinelLastCount then
-                        sentinelLastCount = #findings
-                        local autoSafe = 0
-                        for _, f in ipairs(findings) do if f.autoSafe then autoSafe = autoSafe + 1 end end
-                        log(string.format("[Sentinel] Scan: %s. %d auto-safe fix(es) available.",
-                            SentinelEngine.summaryText(findings), autoSafe))
-                    end
-                end
-            end)
-            if not ok then
-                log("[Sentinel] Background scan error: " .. safeErrorText(err))
-            end
+            task.wait(10)
+            local ok, err = pcall(sentinelAutoTick)
+            if not ok then log("[Sentinel] Autopilot error: " .. safeErrorText(err)) end
         end
     end)
 end
-
 end
 
 -- ============================================================================
