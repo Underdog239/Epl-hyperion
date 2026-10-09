@@ -4012,6 +4012,7 @@ function VM.init(irData, customEnv)
     VM.lastError = nil
     VM.instructions = irData.instructions
     VM.constants = irData.constants or {}
+    VM.regCount = irData.regCount or 0
     VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
     VM.pc = 1
     VM.registers = {}
@@ -4202,9 +4203,17 @@ function VM.step()
     end
     -- Breakpoint check
     if VM.breakpoints[inst.line] and VM.state == "RUNNING" and VM.instructionsExecuted > 1 then
-        VM.state = "PAUSED"
-        if VM.onPause then VM.onPause(inst.line, inst.idx) end
-        return false
+        local shouldPause = true
+        local cond = VM.breakpointConds[inst.line]
+        if cond and cond ~= "" then
+            local okCond, condValue = pcall(VM.evalCondition, cond)
+            shouldPause = okCond and isTruthy(condValue)
+        end
+        if shouldPause then
+            VM.state = "PAUSED"
+            if VM.onPause then VM.onPause(inst.line, inst.idx) end
+            return false
+        end
     end
 
     -- Execute Opcodes
@@ -4489,6 +4498,114 @@ function VM.runContinuous()
         if not cont then break end
     end
 end
+-- ---------------------------------------------------------------------------
+-- Time-travel debugging: reverse execution by deterministic replay.
+-- The VM is a pure state machine, so rewinding to operation N is equivalent to
+-- re-running from a fresh init while suppressing output. Breakpoints are
+-- suspended during the replay so it cannot pause on the way back.
+-- ---------------------------------------------------------------------------
+function VM.rewindTo(targetOps)
+    targetOps = math.max(0, math.floor(tonumber(targetOps) or 0))
+    local irData = {
+        instructions = VM.instructions,
+        constants = VM.constants,
+        regCount = VM.regCount or 0
+    }
+    local savedBreakpoints, savedConds = VM.breakpoints, VM.breakpointConds
+    local savedHits, savedTrace = VM.lineHits, VM.trace
+    VM.breakpoints, VM.breakpointConds = {}, {}
+    VM.init(irData, VM.initialEnv)
+    VM.breakpoints, VM.breakpointConds = savedBreakpoints, savedConds
+    VM.lineHits, VM.trace = savedHits, savedTrace
+    VM.suppressOutput = true
+    VM.state = "RUNNING"
+    VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
+    local ok = true
+    for _ = 1, targetOps do
+        local stepOk, cont = pcall(VM.step)
+        if not stepOk or not cont then ok = false break end
+    end
+    VM.suppressOutput = false
+    if VM.state == "RUNNING" then VM.state = "PAUSED" end
+    return ok, VM.instructionsExecuted
+end
+
+-- Evaluate a watch / breakpoint-condition expression against the paused frame.
+function VM.evalCondition(src)
+    if type(src) ~= "string" or src == "" then return true end
+    local function tryParse(text)
+        local ok, tokens = pcall(Lexer.lex, text, "EPL")
+        if not ok or type(tokens) ~= "table" then return nil end
+        local ok2, ast = pcall(function() return Parser.new(tokens, "EPL"):parse() end)
+        if not ok2 or type(ast) ~= "table" or type(ast.body) ~= "table" then return nil end
+        local stmt = ast.body[1]
+        if stmt and stmt.expr then return stmt.expr end
+        return nil
+    end
+    local expr = tryParse(src) or tryParse("print " .. src)
+    if not expr then return true end
+    return VM.evalNode(expr)
+end
+
+-- A tiny, side-effect-free expression evaluator used by watches/conditions.
+function VM.evalNode(n)
+    if not n then return nil end
+    local tag = n.tag
+    if tag == "number" or tag == "string" or tag == "bool" then return n.value end
+    if tag == "nil" then return nil end
+    if tag == "ident" then
+        if #VM.callStack > 0 then return getScopedValue(VM.callStack[#VM.callStack], n.name) end
+        return VM.environment[n.name]
+    end
+    if tag == "unary" then
+        local v = VM.evalNode(n.operand)
+        if n.op == "not" or n.op == "!" then return not isTruthy(v) end
+        return -(tonumber(v) or 0)
+    end
+    if tag == "member" then
+        local obj = VM.evalNode(n.object)
+        if type(obj) == "table" then return obj[n.member] end
+        return nil
+    end
+    if tag == "call" then
+        local name = n.callee and n.callee.tag == "ident" and n.callee.name or nil
+        local args = {}
+        for _, a in ipairs(n.args or {}) do table.insert(args, VM.evalNode(a)) end
+        if name == "len" and type(args[1]) == "string" then return #args[1] end
+        if name == "type" then return type(args[1]) end
+        if name == "tostring" then return tostring(args[1]) end
+        if name == "tonumber" then return tonumber(args[1]) end
+        return nil
+    end
+    if tag == "binary" then
+        local a, b = VM.evalNode(n.left), VM.evalNode(n.right)
+        local op = n.op
+        if op == "and" then if isTruthy(a) then return b end return a end
+        if op == "or" then if isTruthy(a) then return a end return b end
+        if op == ".." then return tostring(a) .. tostring(b) end
+        if op == "==" then return a == b end
+        if op == "~=" or op == "!=" then return a ~= b end
+        if op == "<" or op == "<=" or op == ">" or op == ">=" then
+            local ta, tb = type(a), type(b)
+            if ta ~= tb or (ta ~= "number" and ta ~= "string") then return nil end
+            if op == "<" then return a < b end
+            if op == "<=" then return a <= b end
+            if op == ">" then return a > b end
+            return a >= b
+        end
+        local na, nb = tonumber(a), tonumber(b)
+        if na == nil or nb == nil then return nil end
+        if op == "+" then return na + nb
+        elseif op == "-" then return na - nb
+        elseif op == "*" then return na * nb
+        elseif op == "/" then if nb == 0 then return nil end return na / nb
+        elseif op == "%" then if nb == 0 then return nil end return na % nb
+        elseif op == "^" then return na ^ nb end
+        return nil
+    end
+    return nil
+end
+
 
 -- ============================================================================
 -- 14. PROFILER & SELF-TEST SUITE
@@ -5002,6 +5119,40 @@ function TestRunner.runAll()
                     and out:find("total", 1, true) == nil
             end
         },
+        {
+            name = "Profiler: Line Hit Counters",
+            fn = function()
+                local ast = parseSourceToAST("set x = 1\nset x = x + 1\nprint x", "EPL")
+                VM.init(HyperionIR.fromAST(ast))
+                VM.runContinuous()
+                return (VM.lineHits[1] or 0) > 0 and (VM.lineHits[2] or 0) > 0
+            end
+        },
+        {
+            name = "Time-Travel: Rewind Restores Earlier State",
+            fn = function()
+                local ast = parseSourceToAST("set x = 1\nset x = 2\nset x = 3\nprint x", "EPL")
+                VM.init(HyperionIR.fromAST(ast))
+                VM.runContinuous()
+                local final = VM.environment["x"]
+                VM.rewindTo(2)
+                local rewound = VM.environment["x"]
+                return final == 3 and rewound == 1
+            end
+        },
+        {
+            name = "Debugger: Conditional Expression Eval",
+            fn = function()
+                VM.init({ instructions = {
+                    { idx = 0, op = "LOADK", a = "R0", b = "0", c = "K0", line = 1, col = 1 },
+                    { idx = 1, op = "RETURN", a = "nil", line = 1, col = 1 }
+                }, constants = { 0 }, regCount = 1 })
+                VM.environment["x"] = 5
+                return VM.evalCondition("x > 3") == true
+                    and VM.evalCondition("x > 9") == false
+                    and VM.evalCondition("x >") ~= true
+            end
+        },
     }
 
     local passed = 0
@@ -5316,9 +5467,16 @@ local targetBtn = toolBtn("Target: Luau", C.text, 100)
 local testBtn   = toolBtn("Tests", C.cyan, 60)
 local clearBtn  = toolBtn("Clear", C.muted, 56)
 local errorsBtn = toolBtn("Errors", C.red, 64)
-local defBtn    = toolBtn("Go Def", C.cyan, 62)
-local renameBtn = toolBtn("Rename", C.purple, 66)
-local heatBtn   = toolBtn("Heat", C.yellow, 52)
+-- IntelliSense / profiler / debugger toolbar buttons (one table keeps the
+-- main chunk under Luau's 200-local limit).
+local extraBtns = {
+    def    = toolBtn("Go Def", C.cyan, 62),
+    rename = toolBtn("Rename", C.purple, 66),
+    heat   = toolBtn("Heat", C.yellow, 52),
+    back   = toolBtn("Back", C.cyan, 54),
+    watch  = toolBtn("Watch", C.purple, 62),
+    cond   = toolBtn("Cond", C.red, 52)
+}
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
@@ -5755,7 +5913,7 @@ local function newDoc(name, text, lang)
         log("Document limit reached (" .. CONFIG.MAX_DOCUMENTS .. ").")
         return nil
     end
-    local d = { name = name, text = text or "", lang = lang or "EPL", bps = {} }
+    local d = { name = name, text = text or "", lang = lang or "EPL", bps = {}, bpConds = {} }
     table.insert(docs, d)
     return d
 end
@@ -6133,9 +6291,12 @@ local function refreshTheme()
     testBtn.TextColor3 = C.cyan
     clearBtn.TextColor3 = C.muted
     errorsBtn.TextColor3 = C.red
-    defBtn.TextColor3 = C.cyan
-    renameBtn.TextColor3 = C.purple
-    heatBtn.TextColor3 = C.yellow
+    extraBtns.def.TextColor3 = C.cyan
+    extraBtns.rename.TextColor3 = C.purple
+    extraBtns.heat.TextColor3 = C.yellow
+    extraBtns.back.TextColor3 = C.cyan
+    extraBtns.watch.TextColor3 = C.purple
+    extraBtns.cond.TextColor3 = C.red
     statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
     rebuildTabs()
@@ -6236,6 +6397,16 @@ local function updateInspector()
         end
     end
     if envShown == 0 then table.insert(lines, "  (none)") end
+    if #VM.watchList > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "-- Watch --")
+        for _, expr in ipairs(VM.watchList) do
+            local okW, val = pcall(VM.evalCondition, expr)
+            local shown = okW and tostring(val) or "<error>"
+            if #shown > 34 then shown = shown:sub(1, 34) .. "..." end
+            table.insert(lines, string.format("  %s = %s", expr, shown))
+        end
+    end
     inspBody.Text = table.concat(lines, "\n")
 end
 
@@ -6288,8 +6459,12 @@ end
 local function applyDocBreakpoints()
     local d = docs[currentDoc]
     VM.breakpoints = {}
+    VM.breakpointConds = {}
     if d then
         for ln in pairs(d.bps) do VM.breakpoints[ln] = true end
+        for ln, cond in pairs(d.bpConds or {}) do
+            if VM.breakpoints[ln] then VM.breakpointConds[ln] = cond end
+        end
     end
 end
 
@@ -6299,6 +6474,8 @@ local function startDebugSession()
     VM.init(ir)
     wireVMCallbacks()
     applyDocBreakpoints()
+    VM.trace = {}
+    VM.traceEnabled = true
     debugSessionActive = true
     return true
 end
@@ -6898,11 +7075,89 @@ local function openRenameDialog()
     box.CursorPosition = #info.name + 1
 end
 
--- ---- Event wiring ----------------------------------------------------------
-defBtn.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
-renameBtn.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
 
-heatBtn.Activated:Connect(safeAction("Heatmap", function()
+-- ---- Small text-prompt dialog (Watch + conditional breakpoints) ------------
+local promptPanel
+local function openPromptDialog(title, initial, hint, onAccept)
+    if promptPanel then promptPanel:Destroy() end
+    promptPanel = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(380, 150), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ZIndex = 90
+    }, root)
+    corner(promptPanel, 8)
+    stroke(promptPanel, C.cyan)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 10),
+        Size = UDim2.new(1, -24, 0, 20), Text = title, TextColor3 = C.cyan, TextSize = 13,
+        Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91 }, promptPanel)
+    local box = mk("TextBox", { Position = UDim2.fromOffset(12, 38), Size = UDim2.new(1, -24, 0, 28),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = initial or "", TextColor3 = C.text,
+        TextSize = 13, Font = Enum.Font.Code, ClearTextOnFocus = false, ZIndex = 91 }, promptPanel)
+    corner(box, 5)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 70),
+        Size = UDim2.new(1, -24, 0, 16), Text = hint or "", TextColor3 = C.muted, TextSize = 11,
+        Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91 }, promptPanel)
+    local okBtn = button(promptPanel, "OK", C.green)
+    okBtn.Position = UDim2.fromOffset(12, 108); okBtn.Size = UDim2.fromOffset(90, 28); okBtn.ZIndex = 91
+    local cancelBtn = button(promptPanel, "Cancel", C.muted)
+    cancelBtn.Position = UDim2.fromOffset(112, 108); cancelBtn.Size = UDim2.fromOffset(90, 28); cancelBtn.ZIndex = 91
+    cancelBtn.Activated:Connect(function()
+        if promptPanel then promptPanel:Destroy(); promptPanel = nil end
+    end)
+    okBtn.Activated:Connect(safeAction("PromptAccept", function()
+        local text = box.Text
+        if promptPanel then promptPanel:Destroy(); promptPanel = nil end
+        onAccept(text)
+    end))
+    box:CaptureFocus()
+    box.CursorPosition = #(initial or "") + 1
+end
+
+extraBtns.back.Activated:Connect(safeAction("StepBack", function()
+    if not debugSessionActive then
+        log("[Debugger] Start a session (Step/Run) before rewinding.")
+        return
+    end
+    local target = VM.instructionsExecuted - 1
+    VM.rewindTo(target)
+    local inst = VM.instructions[VM.pc]
+    if inst then
+        updateStatusBar(string.format("Rewound to op %d (Ln %d, op %s)", VM.instructionsExecuted, inst.line or 1, tostring(inst.op)))
+    end
+    log(string.format("[Debugger] Rewound to operation %d.", VM.instructionsExecuted))
+    updateInspector()
+end))
+
+extraBtns.watch.Activated:Connect(safeAction("Watch", function()
+    openPromptDialog("ADD WATCH EXPRESSION", "", "e.g. x + 1  (evaluated against the paused frame)", function(text)
+        if text == nil or text == "" then return end
+        table.insert(VM.watchList, text)
+        log("[Debugger] Watching: " .. text)
+        updateInspector()
+    end)
+end))
+
+extraBtns.cond.Activated:Connect(safeAction("BreakpointCondition", function()
+    local ln = caretLineCol()
+    local d = docs[currentDoc]
+    if not d then return end
+    if not d.bps[ln] then
+        log(string.format("[Debugger] No breakpoint on line %d - click the gutter number first.", ln))
+        return
+    end
+    d.bpConds = d.bpConds or {}
+    openPromptDialog("BREAKPOINT CONDITION (LINE " .. ln .. ")", d.bpConds[ln] or "", "Pause only when this is true. Blank clears it.", function(text)
+        if text == nil or text == "" then d.bpConds[ln] = nil else d.bpConds[ln] = text end
+        applyDocBreakpoints()
+        log(string.format("[Debugger] Breakpoint on line %d condition: %s", ln, d.bpConds[ln] or "(none)"))
+    end)
+end))
+
+-- ---- Event wiring ----------------------------------------------------------
+extraBtns.def.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
+extraBtns.rename.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
+
+extraBtns.heat.Activated:Connect(safeAction("Heatmap", function()
     heatmapEnabled = not heatmapEnabled
     buildGutter()
     if heatmapEnabled then
