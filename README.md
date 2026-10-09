@@ -41,9 +41,10 @@ Hyperion is a small teaching-language (**EPL**) plus a full polyglot toolchain t
 - **Hyperion IR** — source-mapped pseudo-bytecode with a strict validator.
 - **Optimizer** — provably safe AST constant folding/algebraic reduction plus IR peephole optimization (dead self-move elimination with jump-target remapping).
 - **Sandboxed VM** — call frames, closures, a hardened environment (math/string/table only), and a strict watchdog (1.0 s / 100k instructions, recursion and output caps).
+- **Static type inference & IntelliSense** — a conservative type pass (number / string / bool / nil / table / function / any) that powers autocomplete (symbols, keywords, member access), hover types, go-to-definition, find-references and document-wide rename.
 - **Step debugger** — click a line number to set a breakpoint, then Step / Continue, with a live inspector (registers, call stack, environment).
 - **IDE** — multi-document tabs, syntax highlighting driven by the real lexer (per language), four themes, a terminal, a Hyperion console-error viewer, and Base64 share-code export/import.
-- **Self-test suite** — 34 built-in tests (Tests button), all passing.
+- **Self-test suite** — 38 built-in tests (Tests button), all passing.
 
 ## Safety limits
 
