@@ -7911,6 +7911,15 @@ local sentinelBackup = {}   -- [docIndex] = source before the last auto-fix (und
 local sentinelLastKey = nil
 local sentinelLastCount = -1
 
+-- Sentinel is SILENT by default: findings are never written to the terminal, so
+-- nobody using the IDE sees them. They are only visible in the Sentinel panel,
+-- which the developer opens deliberately. Scanning stays purely static - the
+-- Sentinel never executes the document.
+local sentinelVerbose = false
+local function sentinelLog(msg)
+    if sentinelVerbose then log(msg) end
+end
+
 local function sentinelScan()
     if not SentinelEngine then return nil end
     local src = editor.Text or ""
@@ -7927,13 +7936,13 @@ end
 
 local function sentinelApplySafe()
     if not SentinelEngine then
-        log("[Sentinel] HyperionSentinel module not found - install HyperionModules/HyperionSentinel.lua.")
+        sentinelLog("[Sentinel] HyperionSentinel module not found - install HyperionModules/HyperionSentinel.lua.")
         return
     end
     local src = editor.Text or ""
     local patches = SentinelEngine.proposeFixes(src, docLang(), {})
     if #patches == 0 then
-        log("[Sentinel] No auto-safe fixes available for this document.")
+        sentinelLog("[Sentinel] No auto-safe fixes available for this document.")
         return
     end
     local newSource, statsOrReason = SentinelEngine.apply(src, docLang(), patches, {
@@ -7943,26 +7952,26 @@ local function sentinelApplySafe()
         end,
     })
     if not newSource then
-        log("[Sentinel] Refused to patch (guard tripped): " .. tostring(statsOrReason))
+        sentinelLog("[Sentinel] Refused to patch (guard tripped): " .. tostring(statsOrReason))
         return
     end
     sentinelBackup[currentDoc] = src
     editor.Text = newSource
     markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
-    log(string.format("[Sentinel] Applied %d safe fix(es): %d line(s) changed, %.1f%% of the file retained.",
+    sentinelLog(string.format("[Sentinel] Applied %d safe fix(es): %d line(s) changed, %.1f%% of the file retained.",
         statsOrReason.hunks, statsOrReason.added + statsOrReason.removed, statsOrReason.retainedPercent))
 end
 
 local function sentinelUndo()
     local saved = sentinelBackup[currentDoc]
     if not saved then
-        log("[Sentinel] Nothing to undo.")
+        sentinelLog("[Sentinel] Nothing to undo.")
         return
     end
     editor.Text = saved
     sentinelBackup[currentDoc] = nil
     markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
-    log("[Sentinel] Reverted the last Sentinel patch.")
+    sentinelLog("[Sentinel] Reverted the last Sentinel patch.")
 end
 
 local function sentinelClose()
@@ -8053,17 +8062,17 @@ local function sentinelAutoTick()
             sentinelBackup[currentDoc] = src
             editor.Text = newSource
             markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
-            log(string.format("[Sentinel] Auto-patched %d safe fix(es): %d line(s) changed, %.1f%% retained.",
+            sentinelLog(string.format("[Sentinel] Auto-patched %d safe fix(es): %d line(s) changed, %.1f%% retained.",
                 statsOrReason.hunks, statsOrReason.added + statsOrReason.removed, statsOrReason.retainedPercent))
             return
         elseif statsOrReason then
-            log("[Sentinel] Auto-patch skipped (guard tripped): " .. tostring(statsOrReason))
+            sentinelLog("[Sentinel] Auto-patch skipped (guard tripped): " .. tostring(statsOrReason))
         end
     end
     local findings = SentinelEngine.scan(src, docLang(), {})
     if #findings ~= sentinelLastCount then
         sentinelLastCount = #findings
-        log("[Sentinel] " .. SentinelEngine.summaryText(findings))
+        sentinelLog("[Sentinel] " .. SentinelEngine.summaryText(findings))
     end
 end
 
@@ -8075,7 +8084,7 @@ if SentinelEngine then
         while root.Parent do
             task.wait(10)
             local ok, err = pcall(sentinelAutoTick)
-            if not ok then log("[Sentinel] Autopilot error: " .. safeErrorText(err)) end
+            if not ok then sentinelLog("[Sentinel] Autopilot error: " .. safeErrorText(err)) end
         end
     end)
 end

@@ -23,6 +23,7 @@ Optional ModuleScripts (place them as children of the LocalScript):
 - Only rules flagged `autoSafe` are ever applied automatically; everything else is report-only.
 - Hard guards: ≤25 changed lines, ≤2% of the file, ≤20 hunks, ≤5 net-deleted lines, a 64-byte-floor shrink guard, and the result must re-parse. Any breach → refuse and keep the original.
 - The original source is kept for one-click Undo; the autopilot only ever edits while the editor is unfocused and the text is stable.
+- The Sentinel is **static-only** (it never executes your document) and **silent by default**: findings are never written to the terminal, so nobody using the IDE sees them - they appear only in the Sentinel panel, which the developer opens deliberately.
 
 If either module is absent, Hyperion uses its own built-in implementation, so the script is fully self-contained.
 
