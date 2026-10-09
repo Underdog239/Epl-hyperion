@@ -3011,6 +3011,228 @@ function Optimizer.optimizeAST(node)
     return node
 end
 
+
+-- ---------------------------------------------------------------------------
+-- 10b. CFG-BASED IR OPTIMIZER
+-- Builds basic blocks + a control-flow graph from the register IR and runs
+-- three provably-safe passes: unreachable-block elimination (reachability from
+-- the entry block), copy propagation within basic blocks, and dead pure-store
+-- elimination. Jump targets are remapped as instructions are removed. The pass
+-- validates nothing on its own; the caller wraps it in pcall and falls back to
+-- the unmodified IR on any doubt.
+-- ---------------------------------------------------------------------------
+local function cfgReads(inst)
+    local op, reads = inst.op, {}
+    if op == "MOVE" or op == "NOT" or op == "UNM" or op == "MEMBER" or op == "STORE" then
+        if inst.b then table.insert(reads, inst.b) end
+    elseif op == "PRINT" or op == "WAIT" then
+        if inst.a then table.insert(reads, inst.a) end
+    elseif op == "RETURN" then
+        if inst.a and inst.a ~= "nil" then table.insert(reads, inst.a) end
+    elseif op == "JMPIF" or op == "JMPNOT" then
+        if inst.a then table.insert(reads, inst.a) end
+    elseif op == "ADD" or op == "SUB" or op == "MUL" or op == "DIV" or op == "MOD" or op == "POW"
+        or op == "EQ" or op == "NEQ" or op == "LT" or op == "LE" or op == "GT" or op == "GE"
+        or op == "AND" or op == "OR" or op == "CONCAT" then
+        if inst.b then table.insert(reads, inst.b) end
+        if inst.c then table.insert(reads, inst.c) end
+    elseif op == "CALL" then
+        if type(inst.c) == "string" then
+            for r in inst.c:gmatch("[^,]+") do table.insert(reads, r) end
+        end
+    end
+    return reads
+end
+
+local CFG_PURE_WRITERS = {
+    LOADK = true, LOADBOOL = true, LOADNIL = true, MOVE = true, LOAD = true,
+    ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true,
+    EQ = true, NEQ = true, LT = true, LE = true, GT = true, GE = true,
+    AND = true, OR = true, NOT = true, UNM = true, CONCAT = true, MEMBER = true
+}
+
+-- Register written by an instruction, or nil (declarations / named stores).
+local function cfgWrites(inst)
+    local op = inst.op
+    if op == "DECLARE_LOCAL" or op == "STORE" or op == "DEF_FN"
+        or op == "PRINT" or op == "WAIT" or op == "RETURN"
+        or op == "JMP" or op == "JMPIF" or op == "JMPNOT" then
+        return nil
+    end
+    return inst.a
+end
+
+local function cfgJumpTargets(instr)
+    local targets = {}
+    for _, inst in ipairs(instr) do
+        if inst.op == "JMP" then
+            local t = tonumber(inst.a); if t then targets[t + 1] = true end
+        elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+            local t = tonumber(inst.b); if t then targets[t + 1] = true end
+        end
+    end
+    return targets
+end
+
+function Optimizer.optimizeCFG(irData)
+    local instr = irData.instructions
+    local n = #instr
+    if n == 0 then return nil end
+
+    -- ---- 1. basic blocks -------------------------------------------------
+    local leaders = { [1] = true }
+    for i, inst in ipairs(instr) do
+        local op = inst.op
+        if op == "JMP" then
+            local t = tonumber(inst.a); if t then leaders[t + 1] = true end
+            leaders[i + 1] = true
+        elseif op == "JMPIF" or op == "JMPNOT" then
+            local t = tonumber(inst.b); if t then leaders[t + 1] = true end
+            leaders[i + 1] = true
+        elseif op == "DEF_FN" then
+            local t = tonumber(inst.b); if t then leaders[t + 1] = true end
+        elseif op == "RETURN" then
+            leaders[i + 1] = true
+        end
+    end
+    leaders[n + 1] = nil
+
+    local starts = {}
+    for i = 1, n do if leaders[i] then table.insert(starts, i) end end
+    table.sort(starts)
+
+    local blocks, indexToBlock = {}, {}
+    for bi, startIdx in ipairs(starts) do
+        local stopIdx = (starts[bi + 1] and starts[bi + 1] - 1) or n
+        blocks[bi] = { start = startIdx, stop = stopIdx, succ = {} }
+        for i = startIdx, stopIdx do indexToBlock[i] = bi end
+    end
+
+    for bi, blk in ipairs(blocks) do
+        local last = instr[blk.stop]
+        if last.op == "JMP" then
+            local t = tonumber(last.a)
+            if t and indexToBlock[t + 1] then table.insert(blk.succ, indexToBlock[t + 1]) end
+        elseif last.op == "JMPIF" or last.op == "JMPNOT" then
+            local t = tonumber(last.b)
+            if t and indexToBlock[t + 1] then table.insert(blk.succ, indexToBlock[t + 1]) end
+            if indexToBlock[blk.stop + 1] then table.insert(blk.succ, indexToBlock[blk.stop + 1]) end
+        elseif last.op == "RETURN" then
+            -- terminal: no successors
+        else
+            if indexToBlock[blk.stop + 1] then table.insert(blk.succ, indexToBlock[blk.stop + 1]) end
+        end
+    end
+
+    -- Function bodies are entered dynamically via CALL, not by falling
+    -- through, so add an explicit CFG edge from each DEF_FN to its entry
+    -- block. Without this, reachability would delete every function body.
+    for i, inst in ipairs(instr) do
+        if inst.op == "DEF_FN" then
+            local t = tonumber(inst.b)
+            local src = indexToBlock[i]
+            local dst = t and indexToBlock[t + 1]
+            if src and dst then table.insert(blocks[src].succ, dst) end
+        end
+    end
+
+    -- ---- 2. reachability from the entry block ---------------------------
+    local reachable = {}
+    local stack = { 1 }
+    while #stack > 0 do
+        local bi = table.remove(stack)
+        if bi and not reachable[bi] then
+            reachable[bi] = true
+            for _, s in ipairs(blocks[bi].succ) do
+                if not reachable[s] then table.insert(stack, s) end
+            end
+        end
+    end
+
+    -- ---- 3. copy propagation within each reachable block ----------------
+    for bi, blk in ipairs(blocks) do
+        if reachable[bi] then
+            local m = {}
+            for i = blk.start, blk.stop do
+                local inst = instr[i]
+                local op = inst.op
+                -- Rewrite only register *reads* (never a destination register).
+                if op == "CALL" then
+                    if type(inst.c) == "string" and inst.c ~= "" then
+                        local parts = {}
+                        for part in inst.c:gmatch("[^,]+") do table.insert(parts, m[part] or part) end
+                        inst.c = table.concat(parts, ",")
+                    end
+                elseif op == "PRINT" or op == "WAIT" or op == "RETURN"
+                    or op == "JMPIF" or op == "JMPNOT" then
+                    if inst.a and m[inst.a] then inst.a = m[inst.a] end
+                elseif op == "MOVE" or op == "NOT" or op == "UNM" or op == "MEMBER" or op == "STORE" then
+                    if inst.b and m[inst.b] then inst.b = m[inst.b] end
+                else
+                    if inst.b and m[inst.b] then inst.b = m[inst.b] end
+                    if inst.c and m[inst.c] then inst.c = m[inst.c] end
+                end
+                local w = cfgWrites(inst)
+                if w then
+                    m[w] = nil
+                    for k, v in pairs(m) do if v == w then m[k] = nil end end
+                    if inst.op == "MOVE" and inst.b and inst.b ~= w then
+                        m[w] = m[inst.b] or inst.b
+                    end
+                end
+            end
+        end
+    end
+
+    -- ---- 4. dead pure-store elimination ---------------------------------
+    local readAnywhere = {}
+    for _, inst in ipairs(instr) do
+        for _, r in ipairs(cfgReads(inst)) do readAnywhere[r] = true end
+    end
+    local jumpTargets = cfgJumpTargets(instr)
+
+    local keep = {}
+    for i = 1, n do
+        local bi = indexToBlock[i]
+        local inst = instr[i]
+        local drop = false
+        if not (bi and reachable[bi]) then
+            drop = true
+        elseif CFG_PURE_WRITERS[inst.op] and not jumpTargets[i] then
+            local w = cfgWrites(inst)
+            if w and not readAnywhere[w] then drop = true end
+        end
+        keep[i] = not drop
+    end
+
+    -- ---- 5. rebuild with jump-target remapping --------------------------
+    local map, running = {}, 0
+    for i = 1, n do
+        if keep[i] then map[i] = running; running = running + 1 end
+    end
+    local following = running
+    for i = n, 1, -1 do
+        if keep[i] then following = map[i] else map[i] = following end
+    end
+
+    local out = {}
+    for i = 1, n do
+        if keep[i] then
+            local inst = instr[i]
+            local copy = { idx = #out, op = inst.op, a = inst.a, b = inst.b, c = inst.c, line = inst.line, col = inst.col }
+            if inst.op == "JMP" then
+                copy.a = map[tonumber(inst.a) + 1] or inst.a
+            elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+                copy.b = map[tonumber(inst.b) + 1] or inst.b
+            end
+            table.insert(out, copy)
+        end
+    end
+    if #out == 0 then return nil end
+
+    return { instructions = out, constants = irData.constants, regCount = irData.regCount }
+end
+
 function Optimizer.optimizeIR(irData)
     local validInput, inputError = validateIR(irData)
     if not validInput then error("[Hyperion Optimizer] Refusing invalid IR: " .. tostring(inputError), 0) end
@@ -3064,6 +3286,15 @@ function Optimizer.optimizeIR(irData)
             end
             table.insert(optimized, copy)
         end
+    end
+
+    -- Run the CFG pass on top of the peephole result; fall back silently if
+    -- anything about the transformation looks unsafe.
+    local cfgOk, cfgResult = pcall(Optimizer.optimizeCFG, {
+        instructions = optimized, constants = irData.constants, regCount = irData.regCount
+    })
+    if cfgOk and type(cfgResult) == "table" and type(cfgResult.instructions) == "table" and #cfgResult.instructions > 0 then
+        optimized = cfgResult.instructions
     end
 
     local afterCount = #optimized
@@ -5151,6 +5382,26 @@ function TestRunner.runAll()
                 return VM.evalCondition("x > 3") == true
                     and VM.evalCondition("x > 9") == false
                     and VM.evalCondition("x >") ~= true
+            end
+        },
+        {
+            name = "CFG Optimizer: Unreachable & Dead Code",
+            fn = function()
+                local ir = { instructions = {
+                    { idx = 0, op = "LOADK", a = "R0", b = "1", c = "K0", line = 1, col = 1 },
+                    { idx = 1, op = "LOADK", a = "R9", b = "42", c = "K2", line = 1, col = 1 },
+                    { idx = 2, op = "JMP", a = 5, line = 2, col = 1 },
+                    { idx = 3, op = "LOADK", a = "R1", b = "99", c = "K1", line = 3, col = 1 },
+                    { idx = 4, op = "PRINT", a = "R1", line = 3, col = 1 },
+                    { idx = 5, op = "PRINT", a = "R0", line = 4, col = 1 },
+                    { idx = 6, op = "RETURN", a = "nil", line = 5, col = 1 }
+                }, constants = { 1, 99, 42 }, regCount = 10 }
+                local opt = Optimizer.optimizeCFG(ir)
+                if not opt or #opt.instructions ~= 4 then return false end
+                for _, inst in ipairs(opt.instructions) do
+                    if inst.a == "R9" or inst.a == "R1" then return false end
+                end
+                return true
             end
         },
     }
