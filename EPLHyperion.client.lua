@@ -3871,7 +3871,17 @@ local VM = {
     onOutput = nil,
     onHalt = nil,
     onPause = nil,
-    lastError = nil
+    lastError = nil,
+    -- Profiler / debugger extensions
+    lineHits = {},
+    trace = {},
+    traceEnabled = false,
+    traceLimit = 20000,
+    suppressOutput = false,
+    watchList = {},
+    breakpointConds = {},
+    initialEnv = nil,
+    documentProvider = nil
 }
 
 local VALID_OPCODES = {
@@ -4011,6 +4021,10 @@ function VM.init(irData, customEnv)
     VM.outputBytes = 0
     VM.instructionsExecuted = 0
     VM.state = "IDLE"
+    VM.lineHits = {}
+    VM.trace = {}
+    VM.suppressOutput = false
+    VM.initialEnv = customEnv
 
     -- Sandboxed Safe Environment.
     -- string.rep / string.format / table.concat are wrapped so a program cannot
@@ -4063,7 +4077,7 @@ function VM.init(irData, customEnv)
                 VM.state = "HALTED"
                 error("[Hyperion VM] Execution stopped: maximum output size (10 KB) exceeded.", 0)
             end
-            if VM.onOutput then VM.onOutput(outStr) end
+            if VM.onOutput and not VM.suppressOutput then VM.onOutput(outStr) end
         end
     }
 
@@ -4172,6 +4186,20 @@ function VM.step()
     local inst = VM.instructions[VM.pc]
     local op = inst.op
 
+    -- Line-level profiling + optional execution trace (time-travel debugger).
+    if inst.line then
+        VM.lineHits[inst.line] = (VM.lineHits[inst.line] or 0) + 1
+    end
+    if VM.traceEnabled then
+        if #VM.trace >= VM.traceLimit then
+            local keep = math.floor(VM.traceLimit / 2)
+            local trimmed = {}
+            local n = #VM.trace
+            for i = n - keep + 1, n do table.insert(trimmed, VM.trace[i]) end
+            VM.trace = trimmed
+        end
+        table.insert(VM.trace, { pc = VM.pc, line = inst.line, op = op })
+    end
     -- Breakpoint check
     if VM.breakpoints[inst.line] and VM.state == "RUNNING" and VM.instructionsExecuted > 1 then
         VM.state = "PAUSED"
@@ -4208,7 +4236,11 @@ function VM.step()
         VM.pc = VM.pc + 1
     elseif op == "LOAD" then
         local frame = #VM.callStack > 0 and VM.callStack[#VM.callStack] or nil
-        VM.registers[inst.a] = frame and getScopedValue(frame, inst.b) or VM.environment[inst.b]
+        if frame then
+            VM.registers[inst.a] = getScopedValue(frame, inst.b)
+        else
+            VM.registers[inst.a] = VM.environment[inst.b]
+        end
         VM.pc = VM.pc + 1
     elseif op == "STORE" then
         local val = VM.registers[inst.b]
@@ -4398,7 +4430,8 @@ function VM.step()
             error(string.format("Runtime error at L%d:C%d: Attempt to call undefined function '%s'", inst.line, inst.col, tostring(fnName)), 0)
         end
     elseif op == "RETURN" then
-        local retVal = (inst.a and inst.a ~= "nil") and VM.registers[inst.a] or nil
+        local retVal = nil
+        if inst.a and inst.a ~= "nil" then retVal = VM.registers[inst.a] end
         if #VM.callStack > 0 then
             local frame = table.remove(VM.callStack)
             VM.registers = frame.callerRegisters
@@ -4450,7 +4483,7 @@ function VM.runContinuous()
         if not ok then
             VM.state = "HALTED"
             VM.lastError = tostring(cont)
-            if VM.onOutput then VM.onOutput("[Error] " .. VM.lastError) end
+            if VM.onOutput and not VM.suppressOutput then VM.onOutput("[Error] " .. VM.lastError) end
             break
         end
         if not cont then break end
@@ -4462,8 +4495,42 @@ end
 -- ============================================================================
 local Profiler = {
     timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 },
-    counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+    counts = { tokens = 0, astNodes = 0, irInstructions = 0 },
+    maxLineHits = 1
 }
+
+-- Whether the gutter paints a per-line execution heatmap.
+local heatmapEnabled = true
+
+-- Recompute the hottest-line maximum (call before rendering the gutter).
+function Profiler.computeHeat()
+    local max = 0
+    for _, c in pairs(VM.lineHits) do if c > max then max = c end end
+    Profiler.maxLineHits = math.max(1, max)
+    return Profiler.maxLineHits
+end
+
+-- Return the N hottest executed source lines as { line, hits }.
+function Profiler.hotLines(limit)
+    local list = {}
+    for line, c in pairs(VM.lineHits) do table.insert(list, { line = line, hits = c }) end
+    table.sort(list, function(a, b) return a.hits > b.hits end)
+    local out = {}
+    for i = 1, math.min(limit or 10, #list) do table.insert(out, list[i]) end
+    return out
+end
+
+-- Heat colour for a line (nil when the line was never executed).
+function Profiler.heatColor(line)
+    if not heatmapEnabled then return nil end
+    local hits = VM.lineHits[line]
+    if not hits or hits == 0 then return nil end
+    local t = hits / math.max(1, Profiler.maxLineHits)
+    if t > 0.75 then return C.red
+    elseif t > 0.5 then return C.yellow
+    elseif t > 0.25 then return C.cyan
+    else return C.green end
+end
 
 function Profiler.reset()
     Profiler.timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 }
@@ -5251,6 +5318,7 @@ local clearBtn  = toolBtn("Clear", C.muted, 56)
 local errorsBtn = toolBtn("Errors", C.red, 64)
 local defBtn    = toolBtn("Go Def", C.cyan, 62)
 local renameBtn = toolBtn("Rename", C.purple, 66)
+local heatBtn   = toolBtn("Heat", C.yellow, 52)
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
@@ -5742,6 +5810,7 @@ buildGutter = function()
         if child:IsA("TextButton") then child:Destroy() end
     end
     local lines = countLines(editor.Text)
+    Profiler.computeHeat()
     local capped = math.min(lines, CONFIG.MAX_GUTTER_LINES)
     for ln = 1, capped do
         local gb = mk("TextButton", {
@@ -5749,7 +5818,7 @@ buildGutter = function()
             BackgroundTransparency = 1,
             BorderSizePixel = 0,
             Text = gutterButtonText(ln),
-            TextColor3 = (docs[currentDoc] and docs[currentDoc].bps[ln]) and C.red or C.gutterText,
+            TextColor3 = (docs[currentDoc] and docs[currentDoc].bps[ln]) and C.red or (Profiler.heatColor(ln) or C.gutterText),
             TextSize = 11,
             Font = Enum.Font.Code,
             TextXAlignment = Enum.TextXAlignment.Right,
@@ -6066,6 +6135,7 @@ local function refreshTheme()
     errorsBtn.TextColor3 = C.red
     defBtn.TextColor3 = C.cyan
     renameBtn.TextColor3 = C.purple
+    heatBtn.TextColor3 = C.yellow
     statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
     rebuildTabs()
@@ -6831,6 +6901,24 @@ end
 -- ---- Event wiring ----------------------------------------------------------
 defBtn.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
 renameBtn.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
+
+heatBtn.Activated:Connect(safeAction("Heatmap", function()
+    heatmapEnabled = not heatmapEnabled
+    buildGutter()
+    if heatmapEnabled then
+        Profiler.computeHeat()
+        local hot = Profiler.hotLines(5)
+        if #hot == 0 then
+            log("[Profiler] Heatmap enabled. Run a program to collect line hit counts.")
+        else
+            local parts = {}
+            for _, h in ipairs(hot) do table.insert(parts, string.format("L%d (%d)", h.line, h.hits)) end
+            log("[Profiler] Heatmap enabled. Hottest lines: " .. table.concat(parts, ", "))
+        end
+    else
+        log("[Profiler] Heatmap disabled.")
+    end
+end))
 
 editor:GetPropertyChangedSignal("CursorPosition"):Connect(function()
     if completionState.open then pcall(refreshCompletion, false) end
