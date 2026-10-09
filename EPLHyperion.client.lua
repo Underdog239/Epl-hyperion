@@ -2110,8 +2110,11 @@ function Parser:parseBlock(stopValues)
             end
             if hit then break end
         end
+        local before = self.pos
         local s = self:parseStatement()
         if s then table.insert(body, s) else break end
+        -- Progress guarantee: a handler that consumes nothing would hang here.
+        if self.pos == before then self:take() end
     end
     return body
 end
@@ -2988,6 +2991,24 @@ function Optimizer.optimizeAST(node)
         for _, s in ipairs(node.body or {}) do table.insert(newBody, Optimizer.optimizeAST(s)) end
         node.body = newBody
         return node
+    elseif node.tag == "function" then
+        local nb = {}
+        for _, s in ipairs(node.body or {}) do table.insert(nb, Optimizer.optimizeAST(s)) end
+        node.body = nb
+        return node
+    elseif node.tag == "return" or node.tag == "expr_stmt" then
+        node.expr = Optimizer.optimizeAST(node.expr)
+        return node
+    elseif node.tag == "call" then
+        node.callee = Optimizer.optimizeAST(node.callee)
+        local na = {}
+        for _, a in ipairs(node.args or {}) do table.insert(na, Optimizer.optimizeAST(a)) end
+        node.args = na
+        return node
+    elseif node.tag == "member" or node.tag == "unary" then
+        if node.object then node.object = Optimizer.optimizeAST(node.object) end
+        if node.operand then node.operand = Optimizer.optimizeAST(node.operand) end
+        return node
     elseif node.tag == "while" or node.tag == "if" then
         node.cond = Optimizer.optimizeAST(node.cond)
         if node.body then
@@ -3009,6 +3030,228 @@ function Optimizer.optimizeAST(node)
     end
 
     return node
+end
+
+
+-- ---------------------------------------------------------------------------
+-- 10b. CFG-BASED IR OPTIMIZER
+-- Builds basic blocks + a control-flow graph from the register IR and runs
+-- three provably-safe passes: unreachable-block elimination (reachability from
+-- the entry block), copy propagation within basic blocks, and dead pure-store
+-- elimination. Jump targets are remapped as instructions are removed. The pass
+-- validates nothing on its own; the caller wraps it in pcall and falls back to
+-- the unmodified IR on any doubt.
+-- ---------------------------------------------------------------------------
+Optimizer.cfgReads = function(inst)
+    local op, reads = inst.op, {}
+    if op == "MOVE" or op == "NOT" or op == "UNM" or op == "MEMBER" or op == "STORE" then
+        if inst.b then table.insert(reads, inst.b) end
+    elseif op == "PRINT" or op == "WAIT" then
+        if inst.a then table.insert(reads, inst.a) end
+    elseif op == "RETURN" then
+        if inst.a and inst.a ~= "nil" then table.insert(reads, inst.a) end
+    elseif op == "JMPIF" or op == "JMPNOT" then
+        if inst.a then table.insert(reads, inst.a) end
+    elseif op == "ADD" or op == "SUB" or op == "MUL" or op == "DIV" or op == "MOD" or op == "POW"
+        or op == "EQ" or op == "NEQ" or op == "LT" or op == "LE" or op == "GT" or op == "GE"
+        or op == "AND" or op == "OR" or op == "CONCAT" then
+        if inst.b then table.insert(reads, inst.b) end
+        if inst.c then table.insert(reads, inst.c) end
+    elseif op == "CALL" then
+        if type(inst.c) == "string" then
+            for r in inst.c:gmatch("[^,]+") do table.insert(reads, r) end
+        end
+    end
+    return reads
+end
+
+Optimizer.CFG_PURE_WRITERS = {
+    LOADK = true, LOADBOOL = true, LOADNIL = true, MOVE = true, LOAD = true,
+    ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true,
+    EQ = true, NEQ = true, LT = true, LE = true, GT = true, GE = true,
+    AND = true, OR = true, NOT = true, UNM = true, CONCAT = true, MEMBER = true
+}
+
+-- Register written by an instruction, or nil (declarations / named stores).
+Optimizer.cfgWrites = function(inst)
+    local op = inst.op
+    if op == "DECLARE_LOCAL" or op == "STORE" or op == "DEF_FN"
+        or op == "PRINT" or op == "WAIT" or op == "RETURN"
+        or op == "JMP" or op == "JMPIF" or op == "JMPNOT" then
+        return nil
+    end
+    return inst.a
+end
+
+Optimizer.cfgJumpTargets = function(instr)
+    local targets = {}
+    for _, inst in ipairs(instr) do
+        if inst.op == "JMP" then
+            local t = tonumber(inst.a); if t then targets[t + 1] = true end
+        elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+            local t = tonumber(inst.b); if t then targets[t + 1] = true end
+        end
+    end
+    return targets
+end
+
+function Optimizer.optimizeCFG(irData)
+    local instr = irData.instructions
+    local n = #instr
+    if n == 0 then return nil end
+
+    -- ---- 1. basic blocks -------------------------------------------------
+    local leaders = { [1] = true }
+    for i, inst in ipairs(instr) do
+        local op = inst.op
+        if op == "JMP" then
+            local t = tonumber(inst.a); if t then leaders[t + 1] = true end
+            leaders[i + 1] = true
+        elseif op == "JMPIF" or op == "JMPNOT" then
+            local t = tonumber(inst.b); if t then leaders[t + 1] = true end
+            leaders[i + 1] = true
+        elseif op == "DEF_FN" then
+            local t = tonumber(inst.b); if t then leaders[t + 1] = true end
+        elseif op == "RETURN" then
+            leaders[i + 1] = true
+        end
+    end
+    leaders[n + 1] = nil
+
+    local starts = {}
+    for i = 1, n do if leaders[i] then table.insert(starts, i) end end
+    table.sort(starts)
+
+    local blocks, indexToBlock = {}, {}
+    for bi, startIdx in ipairs(starts) do
+        local stopIdx = (starts[bi + 1] and starts[bi + 1] - 1) or n
+        blocks[bi] = { start = startIdx, stop = stopIdx, succ = {} }
+        for i = startIdx, stopIdx do indexToBlock[i] = bi end
+    end
+
+    for bi, blk in ipairs(blocks) do
+        local last = instr[blk.stop]
+        if last.op == "JMP" then
+            local t = tonumber(last.a)
+            if t and indexToBlock[t + 1] then table.insert(blk.succ, indexToBlock[t + 1]) end
+        elseif last.op == "JMPIF" or last.op == "JMPNOT" then
+            local t = tonumber(last.b)
+            if t and indexToBlock[t + 1] then table.insert(blk.succ, indexToBlock[t + 1]) end
+            if indexToBlock[blk.stop + 1] then table.insert(blk.succ, indexToBlock[blk.stop + 1]) end
+        elseif last.op == "RETURN" then
+            -- terminal: no successors
+        else
+            if indexToBlock[blk.stop + 1] then table.insert(blk.succ, indexToBlock[blk.stop + 1]) end
+        end
+    end
+
+    -- Function bodies are entered dynamically via CALL, not by falling
+    -- through, so add an explicit CFG edge from each DEF_FN to its entry
+    -- block. Without this, reachability would delete every function body.
+    for i, inst in ipairs(instr) do
+        if inst.op == "DEF_FN" then
+            local t = tonumber(inst.b)
+            local src = indexToBlock[i]
+            local dst = t and indexToBlock[t + 1]
+            if src and dst then table.insert(blocks[src].succ, dst) end
+        end
+    end
+
+    -- ---- 2. reachability from the entry block ---------------------------
+    local reachable = {}
+    local stack = { 1 }
+    while #stack > 0 do
+        local bi = table.remove(stack)
+        if bi and not reachable[bi] then
+            reachable[bi] = true
+            for _, s in ipairs(blocks[bi].succ) do
+                if not reachable[s] then table.insert(stack, s) end
+            end
+        end
+    end
+
+    -- ---- 3. copy propagation within each reachable block ----------------
+    for bi, blk in ipairs(blocks) do
+        if reachable[bi] then
+            local m = {}
+            for i = blk.start, blk.stop do
+                local inst = instr[i]
+                local op = inst.op
+                -- Rewrite only register *reads* (never a destination register).
+                if op == "CALL" then
+                    if type(inst.c) == "string" and inst.c ~= "" then
+                        local parts = {}
+                        for part in inst.c:gmatch("[^,]+") do table.insert(parts, m[part] or part) end
+                        inst.c = table.concat(parts, ",")
+                    end
+                elseif op == "PRINT" or op == "WAIT" or op == "RETURN"
+                    or op == "JMPIF" or op == "JMPNOT" then
+                    if inst.a and m[inst.a] then inst.a = m[inst.a] end
+                elseif op == "MOVE" or op == "NOT" or op == "UNM" or op == "MEMBER" or op == "STORE" then
+                    if inst.b and m[inst.b] then inst.b = m[inst.b] end
+                else
+                    if inst.b and m[inst.b] then inst.b = m[inst.b] end
+                    if inst.c and m[inst.c] then inst.c = m[inst.c] end
+                end
+                local w = Optimizer.cfgWrites(inst)
+                if w then
+                    m[w] = nil
+                    for k, v in pairs(m) do if v == w then m[k] = nil end end
+                    if inst.op == "MOVE" and inst.b and inst.b ~= w then
+                        m[w] = m[inst.b] or inst.b
+                    end
+                end
+            end
+        end
+    end
+
+    -- ---- 4. dead pure-store elimination ---------------------------------
+    local readAnywhere = {}
+    for _, inst in ipairs(instr) do
+        for _, r in ipairs(Optimizer.cfgReads(inst)) do readAnywhere[r] = true end
+    end
+    local jumpTargets = Optimizer.cfgJumpTargets(instr)
+
+    local keep = {}
+    for i = 1, n do
+        local bi = indexToBlock[i]
+        local inst = instr[i]
+        local drop = false
+        if not (bi and reachable[bi]) then
+            drop = true
+        elseif Optimizer.CFG_PURE_WRITERS[inst.op] and not jumpTargets[i] then
+            local w = Optimizer.cfgWrites(inst)
+            if w and not readAnywhere[w] then drop = true end
+        end
+        keep[i] = not drop
+    end
+
+    -- ---- 5. rebuild with jump-target remapping --------------------------
+    local map, running = {}, 0
+    for i = 1, n do
+        if keep[i] then map[i] = running; running = running + 1 end
+    end
+    local following = running
+    for i = n, 1, -1 do
+        if keep[i] then following = map[i] else map[i] = following end
+    end
+
+    local out = {}
+    for i = 1, n do
+        if keep[i] then
+            local inst = instr[i]
+            local copy = { idx = #out, op = inst.op, a = inst.a, b = inst.b, c = inst.c, line = inst.line, col = inst.col }
+            if inst.op == "JMP" then
+                copy.a = map[tonumber(inst.a) + 1] or inst.a
+            elseif inst.op == "JMPIF" or inst.op == "JMPNOT" or inst.op == "DEF_FN" then
+                copy.b = map[tonumber(inst.b) + 1] or inst.b
+            end
+            table.insert(out, copy)
+        end
+    end
+    if #out == 0 then return nil end
+
+    return { instructions = out, constants = irData.constants, regCount = irData.regCount }
 end
 
 function Optimizer.optimizeIR(irData)
@@ -3064,6 +3307,15 @@ function Optimizer.optimizeIR(irData)
             end
             table.insert(optimized, copy)
         end
+    end
+
+    -- Run the CFG pass on top of the peephole result; fall back silently if
+    -- anything about the transformation looks unsafe.
+    local cfgOk, cfgResult = pcall(Optimizer.optimizeCFG, {
+        instructions = optimized, constants = irData.constants, regCount = irData.regCount
+    })
+    if cfgOk and type(cfgResult) == "table" and type(cfgResult.instructions) == "table" and #cfgResult.instructions > 0 then
+        optimized = cfgResult.instructions
     end
 
     local afterCount = #optimized
@@ -3437,7 +3689,7 @@ local function translateSource(src, fromLang, toLang)
     return result
 end
 
-local TypeInference, IntelliSense = (function()
+local TypeInference, IntelliSense, HyperionStdlib = (function()
 -- ============================================================================
 -- 12b. STATIC TYPE INFERENCE & INTELLISENSE ENGINE
 --     A conservative, purely client-side type-inference pass that annotates
@@ -3848,7 +4100,287 @@ function IntelliSense.rename(source, line, col, newName, lang)
     end
     return out, #edits
 end
-return TypeInference, IntelliSense
+
+-- ---------------------------------------------------------------------------
+-- 12c. HYPERION STANDARD LIBRARY
+-- A pure, sandbox-safe library exposed to every program as the global `std`.
+-- It deliberately avoids anything with side effects (no io/os/loadstring), so
+-- it is safe inside the VM sandbox. A sibling ModuleScript named
+-- 'HyperionStdlib' may override it (same pattern as HyperionBase64).
+-- ---------------------------------------------------------------------------
+local HyperionStdlib = {}
+HyperionStdlib.VERSION = "1.0.0"
+
+local function num(v) return tonumber(v) or 0 end
+local function isTable(v) return type(v) == "table" end
+
+HyperionStdlib.math = {
+    gcd = function(a, b)
+        a, b = math.abs(math.floor(num(a))), math.abs(math.floor(num(b)))
+        while b ~= 0 do a, b = b, a % b end
+        return a
+    end,
+    lcm = function(a, b)
+        a, b = math.abs(math.floor(num(a))), math.abs(math.floor(num(b)))
+        if a == 0 or b == 0 then return 0 end
+        local x, y = a, b
+        while y ~= 0 do x, y = y, x % y end
+        return math.floor(a / x) * b
+    end,
+    clamp = function(v, lo, hi)
+        v, lo, hi = num(v), num(lo), num(hi)
+        if lo > hi then lo, hi = hi, lo end
+        if v < lo then return lo elseif v > hi then return hi else return v end
+    end,
+    round = function(v, places)
+        local p = 10 ^ math.floor(num(places))
+        if p <= 0 then return num(v) end
+        return math.floor(num(v) * p + 0.5) / p
+    end,
+    sign = function(v)
+        v = num(v)
+        if v > 0 then return 1 elseif v < 0 then return -1 else return 0 end
+    end,
+    factorial = function(n)
+        n = math.floor(num(n))
+        if n < 0 then return 0 end
+        local r = 1
+        for i = 2, n do r = r * i end
+        return r
+    end,
+    isPrime = function(n)
+        n = math.floor(num(n))
+        if n < 2 then return false end
+        if n % 2 == 0 then return n == 2 end
+        local i = 3
+        while i * i <= n do
+            if n % i == 0 then return false end
+            i = i + 2
+        end
+        return true
+    end,
+    sum = function(t)
+        if not isTable(t) then return 0 end
+        local s = 0
+        for _, v in ipairs(t) do s = s + num(v) end
+        return s
+    end,
+    product = function(t)
+        if not isTable(t) then return 0 end
+        local s = 1
+        for _, v in ipairs(t) do s = s * num(v) end
+        return s
+    end,
+    average = function(t)
+        if not isTable(t) or #t == 0 then return 0 end
+        return HyperionStdlib.math.sum(t) / #t
+    end
+}
+
+HyperionStdlib.list = {
+    new = function(...) return { ... } end,
+    push = function(t, v)
+        if not isTable(t) then return t end
+        table.insert(t, v)
+        return t
+    end,
+    pop = function(t)
+        if not isTable(t) or #t == 0 then return nil end
+        return table.remove(t)
+    end,
+    map = function(t, fn)
+        local out = {}
+        if not isTable(t) or type(fn) ~= "function" then return out end
+        for i, v in ipairs(t) do out[i] = fn(v) end
+        return out
+    end,
+    filter = function(t, fn)
+        local out = {}
+        if not isTable(t) or type(fn) ~= "function" then return out end
+        for _, v in ipairs(t) do if fn(v) then table.insert(out, v) end end
+        return out
+    end,
+    reduce = function(t, fn, acc)
+        if not isTable(t) or type(fn) ~= "function" then return acc end
+        for _, v in ipairs(t) do acc = fn(acc, v) end
+        return acc
+    end,
+    sort = function(t, cmp)
+        if not isTable(t) then return t end
+        table.sort(t, type(cmp) == "function" and cmp or nil)
+        return t
+    end,
+    reverse = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for i = #t, 1, -1 do table.insert(out, t[i]) end
+        return out
+    end,
+    contains = function(t, v)
+        if not isTable(t) then return false end
+        for _, x in ipairs(t) do if x == v then return true end end
+        return false
+    end,
+    indexOf = function(t, v)
+        if not isTable(t) then return -1 end
+        for i, x in ipairs(t) do if x == v then return i end end
+        return -1
+    end,
+    slice = function(t, from, to)
+        local out = {}
+        if not isTable(t) then return out end
+        from = math.max(1, math.floor(num(from)))
+        to = math.min(#t, math.floor(num(to)))
+        for i = from, to do table.insert(out, t[i]) end
+        return out
+    end,
+    join = function(t, sep)
+        if not isTable(t) then return "" end
+        local parts = {}
+        for _, v in ipairs(t) do table.insert(parts, tostring(v)) end
+        return table.concat(parts, sep == nil and "," or tostring(sep))
+    end,
+    sum = function(t) return HyperionStdlib.math.sum(t) end,
+    range = function(a, b, step)
+        a, b = math.floor(num(a)), math.floor(num(b))
+        step = math.floor(num(step))
+        if step == 0 then step = 1 end
+        local out = {}
+        if step > 0 then
+            for i = a, b, step do table.insert(out, i) end
+        else
+            for i = a, b, step do table.insert(out, i) end
+        end
+        return out
+    end
+}
+
+HyperionStdlib.string = {
+    trim = function(s)
+        s = tostring(s or "")
+        return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+    end,
+    split = function(s, sep)
+        s = tostring(s or "")
+        sep = sep == nil and "," or tostring(sep)
+        local out = {}
+        if sep == "" then
+            for i = 1, #s do out[i] = s:sub(i, i) end
+            return out
+        end
+        local pattern = "([^" .. sep:gsub("(%W)", "%%%1") .. "]+)"
+        for part in s:gmatch(pattern) do table.insert(out, part) end
+        if #s > 0 and s:sub(-#sep) == sep then table.insert(out, "") end
+        return out
+    end,
+    join = function(t, sep) return HyperionStdlib.list.join(t, sep) end,
+    startsWith = function(s, prefix)
+        s, prefix = tostring(s or ""), tostring(prefix or "")
+        return s:sub(1, #prefix) == prefix
+    end,
+    endsWith = function(s, suffix)
+        s, suffix = tostring(s or ""), tostring(suffix or "")
+        if #suffix == 0 then return true end
+        return s:sub(-#suffix) == suffix
+    end,
+    contains = function(s, needle)
+        return tostring(s or ""):find(tostring(needle or ""), 1, true) ~= nil
+    end,
+    ["repeat"] = function(s, n)
+        n = math.max(0, math.floor(num(n)))
+        return string.rep(tostring(s or ""), n)
+    end,
+    capitalize = function(s)
+        s = tostring(s or "")
+        if #s == 0 then return s end
+        return s:sub(1, 1):upper() .. s:sub(2)
+    end,
+    reverse = function(s)
+        s = tostring(s or "")
+        return s:reverse()
+    end,
+    replace = function(s, from, to)
+        s = tostring(s or "")
+        from = tostring(from or "")
+        to = tostring(to or "")
+        if from == "" then return s end
+        return (s:gsub(from:gsub("(%W)", "%%%1"), to:gsub("%%", "%%%%")))
+    end,
+    lines = function(s)
+        local out = {}
+        for line in (tostring(s or "") .. "\n"):gmatch("([^\n]*)\n") do table.insert(out, line) end
+        return out
+    end,
+    padStart = function(s, len, ch)
+        s = tostring(s or "")
+        ch = tostring(ch or " ")
+        len = math.floor(num(len))
+        while #s < len do s = ch .. s end
+        return s
+    end,
+    padEnd = function(s, len, ch)
+        s = tostring(s or "")
+        ch = tostring(ch or " ")
+        len = math.floor(num(len))
+        while #s < len do s = s .. ch end
+        return s
+    end
+}
+
+HyperionStdlib.table = {
+    keys = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for k in pairs(t) do table.insert(out, k) end
+        return out
+    end,
+    values = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for _, v in pairs(t) do table.insert(out, v) end
+        return out
+    end,
+    merge = function(a, b)
+        local out = {}
+        if isTable(a) then for k, v in pairs(a) do out[k] = v end end
+        if isTable(b) then for k, v in pairs(b) do out[k] = v end end
+        return out
+    end,
+    copy = function(t)
+        local out = {}
+        if isTable(t) then for k, v in pairs(t) do out[k] = v end end
+        return out
+    end,
+    size = function(t)
+        if not isTable(t) then return 0 end
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        return n
+    end,
+    isEmpty = function(t)
+        if not isTable(t) then return true end
+        return next(t) == nil
+    end
+}
+
+HyperionStdlib.util = {
+    range = function(a, b, step) return HyperionStdlib.list.range(a, b, step) end,
+    identity = function(v) return v end,
+    noop = function() end
+}
+
+-- Optional ModuleScript override (named 'HyperionStdlib' beside this script).
+do
+    local module = script:FindFirstChild("HyperionStdlib")
+    if module and module:IsA("ModuleScript") then
+        local ok, loaded = pcall(require, module)
+        if ok and type(loaded) == "table" then
+            HyperionStdlib = loaded
+        end
+    end
+end
+
+return TypeInference, IntelliSense, HyperionStdlib
 end)()
 
 -- ============================================================================
@@ -3871,7 +4403,18 @@ local VM = {
     onOutput = nil,
     onHalt = nil,
     onPause = nil,
-    lastError = nil
+    lastError = nil,
+    -- Profiler / debugger extensions
+    lineHits = {},
+    trace = {},
+    traceEnabled = false,
+    traceLimit = 20000,
+    suppressOutput = false,
+    watchList = {},
+    breakpointConds = {},
+    initialEnv = nil,
+    documentProvider = nil,
+    requireCache = {}
 }
 
 local VALID_OPCODES = {
@@ -4002,6 +4545,7 @@ function VM.init(irData, customEnv)
     VM.lastError = nil
     VM.instructions = irData.instructions
     VM.constants = irData.constants or {}
+    VM.regCount = irData.regCount or 0
     VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
     VM.pc = 1
     VM.registers = {}
@@ -4011,6 +4555,10 @@ function VM.init(irData, customEnv)
     VM.outputBytes = 0
     VM.instructionsExecuted = 0
     VM.state = "IDLE"
+    VM.lineHits = {}
+    VM.trace = {}
+    VM.suppressOutput = false
+    VM.initialEnv = customEnv
 
     -- Sandboxed Safe Environment.
     -- string.rep / string.format / table.concat are wrapped so a program cannot
@@ -4034,15 +4582,35 @@ function VM.init(irData, customEnv)
         return string.rep(s, n)
     end
     safeString.format = function(fmt, ...)
-        if type(fmt) == "string" and fmt:match("%d%d%d%d%d%d%d") then
-            VM.state = "HALTED"
-            error("[Hyperion VM] string.format width too large.", 0)
+        if type(fmt) == "string" then
+            -- Reject any width/precision that could allocate an enormous string
+            -- before string.format is allowed to run.
+            for spec in fmt:gmatch("%%[%-%+ #0]*%d*%.?%d*[a-zA-Z]") do
+                for digits in spec:gmatch("%d+") do
+                    local n = tonumber(digits)
+                    if n and n > 100000 then
+                        VM.state = "HALTED"
+                        error("[Hyperion VM] string.format width/precision too large.", 0)
+                    end
+                end
+            end
         end
         return tooLarge(string.format(fmt, ...))
     end
     local safeTable = {}
     for k, v in pairs(table) do safeTable[k] = v end
     safeTable.concat = function(t, sep, i, j)
+        if type(t) == "table" then
+            local joiner = sep == nil and "" or tostring(sep)
+            local from, to = i or 1, j or #t
+            local total = 0
+            for k = from, to do total = total + #tostring(t[k]) end
+            total = total + #joiner * math.max(0, to - from)
+            if total > CONFIG.MAX_OUTPUT_BYTES then
+                VM.state = "HALTED"
+                error("[Hyperion VM] table.concat result would exceed the sandbox size limit.", 0)
+            end
+        end
         return tooLarge(table.concat(t, sep, i, j))
     end
 
@@ -4063,8 +4631,10 @@ function VM.init(irData, customEnv)
                 VM.state = "HALTED"
                 error("[Hyperion VM] Execution stopped: maximum output size (10 KB) exceeded.", 0)
             end
-            if VM.onOutput then VM.onOutput(outStr) end
-        end
+            if VM.onOutput and not VM.suppressOutput then VM.onOutput(outStr) end
+        end,
+        std = HyperionStdlib,
+        require = function(name) return VM.requireModule(name) end
     }
 
     if customEnv then
@@ -4172,11 +4742,33 @@ function VM.step()
     local inst = VM.instructions[VM.pc]
     local op = inst.op
 
+    -- Line-level profiling + optional execution trace (time-travel debugger).
+    if inst.line then
+        VM.lineHits[inst.line] = (VM.lineHits[inst.line] or 0) + 1
+    end
+    if VM.traceEnabled then
+        if #VM.trace >= VM.traceLimit then
+            local keep = math.floor(VM.traceLimit / 2)
+            local trimmed = {}
+            local n = #VM.trace
+            for i = n - keep + 1, n do table.insert(trimmed, VM.trace[i]) end
+            VM.trace = trimmed
+        end
+        table.insert(VM.trace, { pc = VM.pc, line = inst.line, op = op })
+    end
     -- Breakpoint check
     if VM.breakpoints[inst.line] and VM.state == "RUNNING" and VM.instructionsExecuted > 1 then
-        VM.state = "PAUSED"
-        if VM.onPause then VM.onPause(inst.line, inst.idx) end
-        return false
+        local shouldPause = true
+        local cond = VM.breakpointConds[inst.line]
+        if cond and cond ~= "" then
+            local okCond, condValue = pcall(VM.evalCondition, cond)
+            shouldPause = okCond and isTruthy(condValue)
+        end
+        if shouldPause then
+            VM.state = "PAUSED"
+            if VM.onPause then VM.onPause(inst.line, inst.idx) end
+            return false
+        end
     end
 
     -- Execute Opcodes
@@ -4208,7 +4800,11 @@ function VM.step()
         VM.pc = VM.pc + 1
     elseif op == "LOAD" then
         local frame = #VM.callStack > 0 and VM.callStack[#VM.callStack] or nil
-        VM.registers[inst.a] = frame and getScopedValue(frame, inst.b) or VM.environment[inst.b]
+        if frame then
+            VM.registers[inst.a] = getScopedValue(frame, inst.b)
+        else
+            VM.registers[inst.a] = VM.environment[inst.b]
+        end
         VM.pc = VM.pc + 1
     elseif op == "STORE" then
         local val = VM.registers[inst.b]
@@ -4398,7 +4994,8 @@ function VM.step()
             error(string.format("Runtime error at L%d:C%d: Attempt to call undefined function '%s'", inst.line, inst.col, tostring(fnName)), 0)
         end
     elseif op == "RETURN" then
-        local retVal = (inst.a and inst.a ~= "nil") and VM.registers[inst.a] or nil
+        local retVal = nil
+        if inst.a and inst.a ~= "nil" then retVal = VM.registers[inst.a] end
         if #VM.callStack > 0 then
             local frame = table.remove(VM.callStack)
             VM.registers = frame.callerRegisters
@@ -4450,11 +5047,162 @@ function VM.runContinuous()
         if not ok then
             VM.state = "HALTED"
             VM.lastError = tostring(cont)
-            if VM.onOutput then VM.onOutput("[Error] " .. VM.lastError) end
+            if VM.onOutput and not VM.suppressOutput then VM.onOutput("[Error] " .. VM.lastError) end
             break
         end
         if not cont then break end
     end
+end
+-- ---------------------------------------------------------------------------
+-- Time-travel debugging: reverse execution by deterministic replay.
+-- The VM is a pure state machine, so rewinding to operation N is equivalent to
+-- re-running from a fresh init while suppressing output. Breakpoints are
+-- suspended during the replay so it cannot pause on the way back.
+-- ---------------------------------------------------------------------------
+function VM.rewindTo(targetOps)
+    targetOps = math.max(0, math.floor(tonumber(targetOps) or 0))
+    local irData = {
+        instructions = VM.instructions,
+        constants = VM.constants,
+        regCount = VM.regCount or 0
+    }
+    local savedBreakpoints, savedConds = VM.breakpoints, VM.breakpointConds
+    local savedHits, savedTrace = VM.lineHits, VM.trace
+    VM.breakpoints, VM.breakpointConds = {}, {}
+    VM.init(irData, VM.initialEnv)
+    VM.breakpoints, VM.breakpointConds = savedBreakpoints, savedConds
+    VM.lineHits, VM.trace = savedHits, savedTrace
+    VM.suppressOutput = true
+    VM.state = "RUNNING"
+    VM.deadline = os.clock() + CONFIG.MAX_RUNTIME_SEC
+    local ok = true
+    for _ = 1, targetOps do
+        local stepOk, cont = pcall(VM.step)
+        if not stepOk or not cont then ok = false break end
+    end
+    VM.suppressOutput = false
+    if VM.state == "RUNNING" then VM.state = "PAUSED" end
+    return ok, VM.instructionsExecuted
+end
+
+-- Evaluate a watch / breakpoint-condition expression against the paused frame.
+function VM.evalCondition(src)
+    if type(src) ~= "string" or src == "" then return true end
+    local function tryParse(text)
+        local ok, tokens = pcall(Lexer.lex, text, "EPL")
+        if not ok or type(tokens) ~= "table" then return nil end
+        local ok2, ast = pcall(function() return Parser.new(tokens, "EPL"):parse() end)
+        if not ok2 or type(ast) ~= "table" or type(ast.body) ~= "table" then return nil end
+        local stmt = ast.body[1]
+        if stmt and stmt.expr then return stmt.expr end
+        return nil
+    end
+    local expr = tryParse(src) or tryParse("print " .. src)
+    if not expr then return true end
+    return VM.evalNode(expr)
+end
+
+-- A tiny, side-effect-free expression evaluator used by watches/conditions.
+function VM.evalNode(n)
+    if not n then return nil end
+    local tag = n.tag
+    if tag == "number" or tag == "string" or tag == "bool" then return n.value end
+    if tag == "nil" then return nil end
+    if tag == "ident" then
+        if #VM.callStack > 0 then return getScopedValue(VM.callStack[#VM.callStack], n.name) end
+        return VM.environment[n.name]
+    end
+    if tag == "unary" then
+        local v = VM.evalNode(n.operand)
+        if n.op == "not" or n.op == "!" then return not isTruthy(v) end
+        return -(tonumber(v) or 0)
+    end
+    if tag == "member" then
+        local obj = VM.evalNode(n.object)
+        if type(obj) == "table" then return obj[n.member] end
+        return nil
+    end
+    if tag == "call" then
+        local name = n.callee and n.callee.tag == "ident" and n.callee.name or nil
+        local args = {}
+        for _, a in ipairs(n.args or {}) do table.insert(args, VM.evalNode(a)) end
+        if name == "len" and type(args[1]) == "string" then return #args[1] end
+        if name == "type" then return type(args[1]) end
+        if name == "tostring" then return tostring(args[1]) end
+        if name == "tonumber" then return tonumber(args[1]) end
+        return nil
+    end
+    if tag == "binary" then
+        local a, b = VM.evalNode(n.left), VM.evalNode(n.right)
+        local op = n.op
+        if op == "and" then if isTruthy(a) then return b end return a end
+        if op == "or" then if isTruthy(a) then return a end return b end
+        if op == ".." then return tostring(a) .. tostring(b) end
+        if op == "==" then return a == b end
+        if op == "~=" or op == "!=" then return a ~= b end
+        if op == "<" or op == "<=" or op == ">" or op == ">=" then
+            local ta, tb = type(a), type(b)
+            if ta ~= tb or (ta ~= "number" and ta ~= "string") then return nil end
+            if op == "<" then return a < b end
+            if op == "<=" then return a <= b end
+            if op == ">" then return a > b end
+            return a >= b
+        end
+        local na, nb = tonumber(a), tonumber(b)
+        if na == nil or nb == nil then return nil end
+        if op == "+" then return na + nb
+        elseif op == "-" then return na - nb
+        elseif op == "*" then return na * nb
+        elseif op == "/" then if nb == 0 then return nil end return na / nb
+        elseif op == "%" then if nb == 0 then return nil end return na % nb
+        elseif op == "^" then return na ^ nb end
+        return nil
+    end
+    return nil
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Isolated sub-VM execution + cross-document package loading (`require`).
+-- A module document is compiled and run in a fresh sandbox; only its
+-- non-builtin, non-function globals are re-exported as the module table.
+-- ---------------------------------------------------------------------------
+local MODULE_BUILTIN_KEYS = {
+    math = true, string = true, table = true, task = true, std = true,
+    tostring = true, tonumber = true, type = true, ["print"] = true, require = true
+}
+
+function VM.runIsolated(irData)
+    local saved = {}
+    for k, v in pairs(VM) do saved[k] = v end
+    VM.init(irData, VM.initialEnv)
+    VM.suppressOutput = true
+    VM.state = "RUNNING"
+    VM.runContinuous()
+    local env = VM.environment
+    for k in pairs(VM) do VM[k] = nil end
+    for k, v in pairs(saved) do VM[k] = v end
+    return env
+end
+
+function VM.requireModule(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    if VM.requireCache[name] then return VM.requireCache[name] end
+    local provider = VM.documentProvider
+    if type(provider) ~= "function" then return nil end
+    local okDoc, doc = pcall(provider, name)
+    if not okDoc or type(doc) ~= "table" or type(doc.source) ~= "string" then return nil end
+    local okAst, ast = pcall(parseSourceToAST, doc.source, doc.lang or "EPL")
+    if not okAst or type(ast) ~= "table" then return nil end
+    local okIR, ir = pcall(HyperionIR.fromAST, ast)
+    if not okIR or type(ir) ~= "table" then return nil end
+    local env = VM.runIsolated(ir)
+    local exports = {}
+    for k, v in pairs(env) do
+        if not MODULE_BUILTIN_KEYS[k] and type(v) ~= "function" then exports[k] = v end
+    end
+    VM.requireCache[name] = exports
+    return exports
 end
 
 -- ============================================================================
@@ -4462,12 +5210,47 @@ end
 -- ============================================================================
 local Profiler = {
     timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 },
-    counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+    counts = { tokens = 0, astNodes = 0, irInstructions = 0 },
+    maxLineHits = 1
 }
+
+-- Whether the gutter paints a per-line execution heatmap.
+local heatmapEnabled = true
+
+-- Recompute the hottest-line maximum (call before rendering the gutter).
+function Profiler.computeHeat()
+    local max = 0
+    for _, c in pairs(VM.lineHits) do if c > max then max = c end end
+    Profiler.maxLineHits = math.max(1, max)
+    return Profiler.maxLineHits
+end
+
+-- Return the N hottest executed source lines as { line, hits }.
+function Profiler.hotLines(limit)
+    local list = {}
+    for line, c in pairs(VM.lineHits) do table.insert(list, { line = line, hits = c }) end
+    table.sort(list, function(a, b) return a.hits > b.hits end)
+    local out = {}
+    for i = 1, math.min(limit or 10, #list) do table.insert(out, list[i]) end
+    return out
+end
+
+-- Heat colour for a line (nil when the line was never executed).
+function Profiler.heatColor(line)
+    if not heatmapEnabled then return nil end
+    local hits = VM.lineHits[line]
+    if not hits or hits == 0 then return nil end
+    local t = hits / math.max(1, Profiler.maxLineHits)
+    if t > 0.75 then return C.red
+    elseif t > 0.5 then return C.yellow
+    elseif t > 0.25 then return C.cyan
+    else return C.green end
+end
 
 function Profiler.reset()
     Profiler.timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 }
     Profiler.counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+    Profiler.maxLineHits = 1
 end
 
 local TestRunner = {}
@@ -4935,6 +5718,104 @@ function TestRunner.runAll()
                     and out:find("total", 1, true) == nil
             end
         },
+        {
+            name = "Profiler: Line Hit Counters",
+            fn = function()
+                local ast = parseSourceToAST("set x = 1\nset x = x + 1\nprint x", "EPL")
+                VM.init(HyperionIR.fromAST(ast))
+                VM.runContinuous()
+                return (VM.lineHits[1] or 0) > 0 and (VM.lineHits[2] or 0) > 0
+            end
+        },
+        {
+            name = "Time-Travel: Rewind Restores Earlier State",
+            fn = function()
+                local ast = parseSourceToAST("set x = 1\nset x = 2\nset x = 3\nprint x", "EPL")
+                VM.init(HyperionIR.fromAST(ast))
+                VM.runContinuous()
+                local final = VM.environment["x"]
+                VM.rewindTo(2)
+                local rewound = VM.environment["x"]
+                return final == 3 and rewound == 1
+            end
+        },
+        {
+            name = "Debugger: Conditional Expression Eval",
+            fn = function()
+                VM.init({ instructions = {
+                    { idx = 0, op = "LOADK", a = "R0", b = "0", c = "K0", line = 1, col = 1 },
+                    { idx = 1, op = "RETURN", a = "nil", line = 1, col = 1 }
+                }, constants = { 0 }, regCount = 1 })
+                VM.environment["x"] = 5
+                return VM.evalCondition("x > 3") == true
+                    and VM.evalCondition("x > 9") == false
+                    and VM.evalCondition("x >") ~= true
+            end
+        },
+        {
+            name = "CFG Optimizer: Unreachable & Dead Code",
+            fn = function()
+                local ir = { instructions = {
+                    { idx = 0, op = "LOADK", a = "R0", b = "1", c = "K0", line = 1, col = 1 },
+                    { idx = 1, op = "LOADK", a = "R9", b = "42", c = "K2", line = 1, col = 1 },
+                    { idx = 2, op = "JMP", a = 5, line = 2, col = 1 },
+                    { idx = 3, op = "LOADK", a = "R1", b = "99", c = "K1", line = 3, col = 1 },
+                    { idx = 4, op = "PRINT", a = "R1", line = 3, col = 1 },
+                    { idx = 5, op = "PRINT", a = "R0", line = 4, col = 1 },
+                    { idx = 6, op = "RETURN", a = "nil", line = 5, col = 1 }
+                }, constants = { 1, 99, 42 }, regCount = 10 }
+                local opt = Optimizer.optimizeCFG(ir)
+                if not opt or #opt.instructions ~= 4 then return false end
+                for _, inst in ipairs(opt.instructions) do
+                    if inst.a == "R9" or inst.a == "R1" then return false end
+                end
+                return true
+            end
+        },
+        {
+            name = "Standard Library: math, list & string",
+            fn = function()
+                local function runOut(src)
+                    local ast = parseSourceToAST(src, "EPL")
+                    local ir = HyperionIR.fromAST(ast)
+                    local out = {}
+                    VM.onOutput = function(s) table.insert(out, tostring(s)) end
+                    VM.init(ir)
+                    VM.runContinuous()
+                    return table.concat(out, "|")
+                end
+                return runOut("print std.math.gcd(12, 18)") == "6"
+                    and runOut("print std.list.sum(std.list.range(1, 5, 1))") == "15"
+                    and runOut('print std.string.trim("  hi  ")') == 'hi'
+            end
+        },
+        {
+            name = "Package System: require across documents",
+            fn = function()
+                VM.documentProvider = function(name)
+                    if name == "geom" then return { source = "set area = 42", lang = "EPL" } end
+                    return nil
+                end
+                VM.requireCache = {}
+                local ast = parseSourceToAST('set m = require("geom")\nprint m.area', "EPL")
+                local ir = HyperionIR.fromAST(ast)
+                local out = {}
+                VM.onOutput = function(s) table.insert(out, tostring(s)) end
+                VM.init(ir)
+                VM.runContinuous()
+                return table.concat(out, "|") == "42"
+            end
+        },
+        {
+            name = "Sandbox: string.format width guard",
+            fn = function()
+                local ast = parseSourceToAST('set s = string.format("%200000d", 5)', "EPL")
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED"
+            end
+        },
     }
 
     local passed = 0
@@ -5249,8 +6130,16 @@ local targetBtn = toolBtn("Target: Luau", C.text, 100)
 local testBtn   = toolBtn("Tests", C.cyan, 60)
 local clearBtn  = toolBtn("Clear", C.muted, 56)
 local errorsBtn = toolBtn("Errors", C.red, 64)
-local defBtn    = toolBtn("Go Def", C.cyan, 62)
-local renameBtn = toolBtn("Rename", C.purple, 66)
+-- IntelliSense / profiler / debugger toolbar buttons (one table keeps the
+-- main chunk under Luau's 200-local limit).
+local extraBtns = {
+    def    = toolBtn("Go Def", C.cyan, 62),
+    rename = toolBtn("Rename", C.purple, 66),
+    heat   = toolBtn("Heat", C.yellow, 52),
+    back   = toolBtn("Back", C.cyan, 54),
+    watch  = toolBtn("Watch", C.purple, 62),
+    cond   = toolBtn("Cond", C.red, 52)
+}
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
@@ -5687,7 +6576,7 @@ local function newDoc(name, text, lang)
         log("Document limit reached (" .. CONFIG.MAX_DOCUMENTS .. ").")
         return nil
     end
-    local d = { name = name, text = text or "", lang = lang or "EPL", bps = {} }
+    local d = { name = name, text = text or "", lang = lang or "EPL", bps = {}, bpConds = {} }
     table.insert(docs, d)
     return d
 end
@@ -5742,6 +6631,7 @@ buildGutter = function()
         if child:IsA("TextButton") then child:Destroy() end
     end
     local lines = countLines(editor.Text)
+    Profiler.computeHeat()
     local capped = math.min(lines, CONFIG.MAX_GUTTER_LINES)
     for ln = 1, capped do
         local gb = mk("TextButton", {
@@ -5749,7 +6639,7 @@ buildGutter = function()
             BackgroundTransparency = 1,
             BorderSizePixel = 0,
             Text = gutterButtonText(ln),
-            TextColor3 = (docs[currentDoc] and docs[currentDoc].bps[ln]) and C.red or C.gutterText,
+            TextColor3 = (docs[currentDoc] and docs[currentDoc].bps[ln]) and C.red or (Profiler.heatColor(ln) or C.gutterText),
             TextSize = 11,
             Font = Enum.Font.Code,
             TextXAlignment = Enum.TextXAlignment.Right,
@@ -6064,8 +6954,12 @@ local function refreshTheme()
     testBtn.TextColor3 = C.cyan
     clearBtn.TextColor3 = C.muted
     errorsBtn.TextColor3 = C.red
-    defBtn.TextColor3 = C.cyan
-    renameBtn.TextColor3 = C.purple
+    extraBtns.def.TextColor3 = C.cyan
+    extraBtns.rename.TextColor3 = C.purple
+    extraBtns.heat.TextColor3 = C.yellow
+    extraBtns.back.TextColor3 = C.cyan
+    extraBtns.watch.TextColor3 = C.purple
+    extraBtns.cond.TextColor3 = C.red
     statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
     rebuildTabs()
@@ -6166,7 +7060,28 @@ local function updateInspector()
         end
     end
     if envShown == 0 then table.insert(lines, "  (none)") end
+    if #VM.watchList > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "-- Watch --")
+        for _, expr in ipairs(VM.watchList) do
+            local okW, val = pcall(VM.evalCondition, expr)
+            local shown = okW and tostring(val) or "<error>"
+            if #shown > 34 then shown = shown:sub(1, 34) .. "..." end
+            table.insert(lines, string.format("  %s = %s", expr, shown))
+        end
+    end
     inspBody.Text = table.concat(lines, "\n")
+end
+
+VM.documentProvider = function(name)
+    if type(name) ~= "string" then return nil end
+    for _, d in ipairs(docs) do
+        local base = d.name:gsub("%.[^.]+$", "")
+        if d.name == name or base == name then
+            return { source = d.text or "", lang = d.lang or "EPL" }
+        end
+    end
+    return nil
 end
 
 local function wireVMCallbacks()
@@ -6218,8 +7133,12 @@ end
 local function applyDocBreakpoints()
     local d = docs[currentDoc]
     VM.breakpoints = {}
+    VM.breakpointConds = {}
     if d then
         for ln in pairs(d.bps) do VM.breakpoints[ln] = true end
+        for ln, cond in pairs(d.bpConds or {}) do
+            if VM.breakpoints[ln] then VM.breakpointConds[ln] = cond end
+        end
     end
 end
 
@@ -6229,6 +7148,8 @@ local function startDebugSession()
     VM.init(ir)
     wireVMCallbacks()
     applyDocBreakpoints()
+    VM.trace = {}
+    VM.traceEnabled = true
     debugSessionActive = true
     return true
 end
@@ -6828,9 +7749,105 @@ local function openRenameDialog()
     box.CursorPosition = #info.name + 1
 end
 
+
+-- ---- Small text-prompt dialog (Watch + conditional breakpoints) ------------
+local promptPanel
+local function openPromptDialog(title, initial, hint, onAccept)
+    if promptPanel then promptPanel:Destroy() end
+    promptPanel = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(380, 150), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ZIndex = 90
+    }, root)
+    corner(promptPanel, 8)
+    stroke(promptPanel, C.cyan)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 10),
+        Size = UDim2.new(1, -24, 0, 20), Text = title, TextColor3 = C.cyan, TextSize = 13,
+        Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91 }, promptPanel)
+    local box = mk("TextBox", { Position = UDim2.fromOffset(12, 38), Size = UDim2.new(1, -24, 0, 28),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = initial or "", TextColor3 = C.text,
+        TextSize = 13, Font = Enum.Font.Code, ClearTextOnFocus = false, ZIndex = 91 }, promptPanel)
+    corner(box, 5)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 70),
+        Size = UDim2.new(1, -24, 0, 16), Text = hint or "", TextColor3 = C.muted, TextSize = 11,
+        Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91 }, promptPanel)
+    local okBtn = button(promptPanel, "OK", C.green)
+    okBtn.Position = UDim2.fromOffset(12, 108); okBtn.Size = UDim2.fromOffset(90, 28); okBtn.ZIndex = 91
+    local cancelBtn = button(promptPanel, "Cancel", C.muted)
+    cancelBtn.Position = UDim2.fromOffset(112, 108); cancelBtn.Size = UDim2.fromOffset(90, 28); cancelBtn.ZIndex = 91
+    cancelBtn.Activated:Connect(function()
+        if promptPanel then promptPanel:Destroy(); promptPanel = nil end
+    end)
+    okBtn.Activated:Connect(safeAction("PromptAccept", function()
+        local text = box.Text
+        if promptPanel then promptPanel:Destroy(); promptPanel = nil end
+        onAccept(text)
+    end))
+    box:CaptureFocus()
+    box.CursorPosition = #(initial or "") + 1
+end
+
+extraBtns.back.Activated:Connect(safeAction("StepBack", function()
+    if not debugSessionActive then
+        log("[Debugger] Start a session (Step/Run) before rewinding.")
+        return
+    end
+    local target = VM.instructionsExecuted - 1
+    VM.rewindTo(target)
+    local inst = VM.instructions[VM.pc]
+    if inst then
+        updateStatusBar(string.format("Rewound to op %d (Ln %d, op %s)", VM.instructionsExecuted, inst.line or 1, tostring(inst.op)))
+    end
+    log(string.format("[Debugger] Rewound to operation %d.", VM.instructionsExecuted))
+    updateInspector()
+end))
+
+extraBtns.watch.Activated:Connect(safeAction("Watch", function()
+    openPromptDialog("ADD WATCH EXPRESSION", "", "e.g. x + 1  (evaluated against the paused frame)", function(text)
+        if text == nil or text == "" then return end
+        table.insert(VM.watchList, text)
+        log("[Debugger] Watching: " .. text)
+        updateInspector()
+    end)
+end))
+
+extraBtns.cond.Activated:Connect(safeAction("BreakpointCondition", function()
+    local ln = caretLineCol()
+    local d = docs[currentDoc]
+    if not d then return end
+    if not d.bps[ln] then
+        log(string.format("[Debugger] No breakpoint on line %d - click the gutter number first.", ln))
+        return
+    end
+    d.bpConds = d.bpConds or {}
+    openPromptDialog("BREAKPOINT CONDITION (LINE " .. ln .. ")", d.bpConds[ln] or "", "Pause only when this is true. Blank clears it.", function(text)
+        if text == nil or text == "" then d.bpConds[ln] = nil else d.bpConds[ln] = text end
+        applyDocBreakpoints()
+        log(string.format("[Debugger] Breakpoint on line %d condition: %s", ln, d.bpConds[ln] or "(none)"))
+    end)
+end))
+
 -- ---- Event wiring ----------------------------------------------------------
-defBtn.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
-renameBtn.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
+extraBtns.def.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
+extraBtns.rename.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
+
+extraBtns.heat.Activated:Connect(safeAction("Heatmap", function()
+    heatmapEnabled = not heatmapEnabled
+    buildGutter()
+    if heatmapEnabled then
+        Profiler.computeHeat()
+        local hot = Profiler.hotLines(5)
+        if #hot == 0 then
+            log("[Profiler] Heatmap enabled. Run a program to collect line hit counts.")
+        else
+            local parts = {}
+            for _, h in ipairs(hot) do table.insert(parts, string.format("L%d (%d)", h.line, h.hits)) end
+            log("[Profiler] Heatmap enabled. Hottest lines: " .. table.concat(parts, ", "))
+        end
+    else
+        log("[Profiler] Heatmap disabled.")
+    end
+end))
 
 editor:GetPropertyChangedSignal("CursorPosition"):Connect(function()
     if completionState.open then pcall(refreshCompletion, false) end
