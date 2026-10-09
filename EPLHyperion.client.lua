@@ -3021,7 +3021,7 @@ end
 -- validates nothing on its own; the caller wraps it in pcall and falls back to
 -- the unmodified IR on any doubt.
 -- ---------------------------------------------------------------------------
-local function cfgReads(inst)
+Optimizer.cfgReads = function(inst)
     local op, reads = inst.op, {}
     if op == "MOVE" or op == "NOT" or op == "UNM" or op == "MEMBER" or op == "STORE" then
         if inst.b then table.insert(reads, inst.b) end
@@ -3044,7 +3044,7 @@ local function cfgReads(inst)
     return reads
 end
 
-local CFG_PURE_WRITERS = {
+Optimizer.CFG_PURE_WRITERS = {
     LOADK = true, LOADBOOL = true, LOADNIL = true, MOVE = true, LOAD = true,
     ADD = true, SUB = true, MUL = true, DIV = true, MOD = true, POW = true,
     EQ = true, NEQ = true, LT = true, LE = true, GT = true, GE = true,
@@ -3052,7 +3052,7 @@ local CFG_PURE_WRITERS = {
 }
 
 -- Register written by an instruction, or nil (declarations / named stores).
-local function cfgWrites(inst)
+Optimizer.cfgWrites = function(inst)
     local op = inst.op
     if op == "DECLARE_LOCAL" or op == "STORE" or op == "DEF_FN"
         or op == "PRINT" or op == "WAIT" or op == "RETURN"
@@ -3062,7 +3062,7 @@ local function cfgWrites(inst)
     return inst.a
 end
 
-local function cfgJumpTargets(instr)
+Optimizer.cfgJumpTargets = function(instr)
     local targets = {}
     for _, inst in ipairs(instr) do
         if inst.op == "JMP" then
@@ -3172,7 +3172,7 @@ function Optimizer.optimizeCFG(irData)
                     if inst.b and m[inst.b] then inst.b = m[inst.b] end
                     if inst.c and m[inst.c] then inst.c = m[inst.c] end
                 end
-                local w = cfgWrites(inst)
+                local w = Optimizer.cfgWrites(inst)
                 if w then
                     m[w] = nil
                     for k, v in pairs(m) do if v == w then m[k] = nil end end
@@ -3187,9 +3187,9 @@ function Optimizer.optimizeCFG(irData)
     -- ---- 4. dead pure-store elimination ---------------------------------
     local readAnywhere = {}
     for _, inst in ipairs(instr) do
-        for _, r in ipairs(cfgReads(inst)) do readAnywhere[r] = true end
+        for _, r in ipairs(Optimizer.cfgReads(inst)) do readAnywhere[r] = true end
     end
-    local jumpTargets = cfgJumpTargets(instr)
+    local jumpTargets = Optimizer.cfgJumpTargets(instr)
 
     local keep = {}
     for i = 1, n do
@@ -3198,8 +3198,8 @@ function Optimizer.optimizeCFG(irData)
         local drop = false
         if not (bi and reachable[bi]) then
             drop = true
-        elseif CFG_PURE_WRITERS[inst.op] and not jumpTargets[i] then
-            local w = cfgWrites(inst)
+        elseif Optimizer.CFG_PURE_WRITERS[inst.op] and not jumpTargets[i] then
+            local w = Optimizer.cfgWrites(inst)
             if w and not readAnywhere[w] then drop = true end
         end
         keep[i] = not drop
@@ -3668,7 +3668,7 @@ local function translateSource(src, fromLang, toLang)
     return result
 end
 
-local TypeInference, IntelliSense = (function()
+local TypeInference, IntelliSense, HyperionStdlib = (function()
 -- ============================================================================
 -- 12b. STATIC TYPE INFERENCE & INTELLISENSE ENGINE
 --     A conservative, purely client-side type-inference pass that annotates
@@ -4079,7 +4079,287 @@ function IntelliSense.rename(source, line, col, newName, lang)
     end
     return out, #edits
 end
-return TypeInference, IntelliSense
+
+-- ---------------------------------------------------------------------------
+-- 12c. HYPERION STANDARD LIBRARY
+-- A pure, sandbox-safe library exposed to every program as the global `std`.
+-- It deliberately avoids anything with side effects (no io/os/loadstring), so
+-- it is safe inside the VM sandbox. A sibling ModuleScript named
+-- 'HyperionStdlib' may override it (same pattern as HyperionBase64).
+-- ---------------------------------------------------------------------------
+local HyperionStdlib = {}
+HyperionStdlib.VERSION = "1.0.0"
+
+local function num(v) return tonumber(v) or 0 end
+local function isTable(v) return type(v) == "table" end
+
+HyperionStdlib.math = {
+    gcd = function(a, b)
+        a, b = math.abs(math.floor(num(a))), math.abs(math.floor(num(b)))
+        while b ~= 0 do a, b = b, a % b end
+        return a
+    end,
+    lcm = function(a, b)
+        a, b = math.abs(math.floor(num(a))), math.abs(math.floor(num(b)))
+        if a == 0 or b == 0 then return 0 end
+        local x, y = a, b
+        while y ~= 0 do x, y = y, x % y end
+        return math.floor(a / x) * b
+    end,
+    clamp = function(v, lo, hi)
+        v, lo, hi = num(v), num(lo), num(hi)
+        if lo > hi then lo, hi = hi, lo end
+        if v < lo then return lo elseif v > hi then return hi else return v end
+    end,
+    round = function(v, places)
+        local p = 10 ^ math.floor(num(places))
+        if p <= 0 then return num(v) end
+        return math.floor(num(v) * p + 0.5) / p
+    end,
+    sign = function(v)
+        v = num(v)
+        if v > 0 then return 1 elseif v < 0 then return -1 else return 0 end
+    end,
+    factorial = function(n)
+        n = math.floor(num(n))
+        if n < 0 then return 0 end
+        local r = 1
+        for i = 2, n do r = r * i end
+        return r
+    end,
+    isPrime = function(n)
+        n = math.floor(num(n))
+        if n < 2 then return false end
+        if n % 2 == 0 then return n == 2 end
+        local i = 3
+        while i * i <= n do
+            if n % i == 0 then return false end
+            i = i + 2
+        end
+        return true
+    end,
+    sum = function(t)
+        if not isTable(t) then return 0 end
+        local s = 0
+        for _, v in ipairs(t) do s = s + num(v) end
+        return s
+    end,
+    product = function(t)
+        if not isTable(t) then return 0 end
+        local s = 1
+        for _, v in ipairs(t) do s = s * num(v) end
+        return s
+    end,
+    average = function(t)
+        if not isTable(t) or #t == 0 then return 0 end
+        return HyperionStdlib.math.sum(t) / #t
+    end
+}
+
+HyperionStdlib.list = {
+    new = function(...) return { ... } end,
+    push = function(t, v)
+        if not isTable(t) then return t end
+        table.insert(t, v)
+        return t
+    end,
+    pop = function(t)
+        if not isTable(t) or #t == 0 then return nil end
+        return table.remove(t)
+    end,
+    map = function(t, fn)
+        local out = {}
+        if not isTable(t) or type(fn) ~= "function" then return out end
+        for i, v in ipairs(t) do out[i] = fn(v) end
+        return out
+    end,
+    filter = function(t, fn)
+        local out = {}
+        if not isTable(t) or type(fn) ~= "function" then return out end
+        for _, v in ipairs(t) do if fn(v) then table.insert(out, v) end end
+        return out
+    end,
+    reduce = function(t, fn, acc)
+        if not isTable(t) or type(fn) ~= "function" then return acc end
+        for _, v in ipairs(t) do acc = fn(acc, v) end
+        return acc
+    end,
+    sort = function(t, cmp)
+        if not isTable(t) then return t end
+        table.sort(t, type(cmp) == "function" and cmp or nil)
+        return t
+    end,
+    reverse = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for i = #t, 1, -1 do table.insert(out, t[i]) end
+        return out
+    end,
+    contains = function(t, v)
+        if not isTable(t) then return false end
+        for _, x in ipairs(t) do if x == v then return true end end
+        return false
+    end,
+    indexOf = function(t, v)
+        if not isTable(t) then return -1 end
+        for i, x in ipairs(t) do if x == v then return i end end
+        return -1
+    end,
+    slice = function(t, from, to)
+        local out = {}
+        if not isTable(t) then return out end
+        from = math.max(1, math.floor(num(from)))
+        to = math.min(#t, math.floor(num(to)))
+        for i = from, to do table.insert(out, t[i]) end
+        return out
+    end,
+    join = function(t, sep)
+        if not isTable(t) then return "" end
+        local parts = {}
+        for _, v in ipairs(t) do table.insert(parts, tostring(v)) end
+        return table.concat(parts, sep == nil and "," or tostring(sep))
+    end,
+    sum = function(t) return HyperionStdlib.math.sum(t) end,
+    range = function(a, b, step)
+        a, b = math.floor(num(a)), math.floor(num(b))
+        step = math.floor(num(step))
+        if step == 0 then step = 1 end
+        local out = {}
+        if step > 0 then
+            for i = a, b, step do table.insert(out, i) end
+        else
+            for i = a, b, step do table.insert(out, i) end
+        end
+        return out
+    end
+}
+
+HyperionStdlib.string = {
+    trim = function(s)
+        s = tostring(s or "")
+        return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+    end,
+    split = function(s, sep)
+        s = tostring(s or "")
+        sep = sep == nil and "," or tostring(sep)
+        local out = {}
+        if sep == "" then
+            for i = 1, #s do out[i] = s:sub(i, i) end
+            return out
+        end
+        local pattern = "([^" .. sep:gsub("(%W)", "%%%1") .. "]+)"
+        for part in s:gmatch(pattern) do table.insert(out, part) end
+        if #s > 0 and s:sub(-#sep) == sep then table.insert(out, "") end
+        return out
+    end,
+    join = function(t, sep) return HyperionStdlib.list.join(t, sep) end,
+    startsWith = function(s, prefix)
+        s, prefix = tostring(s or ""), tostring(prefix or "")
+        return s:sub(1, #prefix) == prefix
+    end,
+    endsWith = function(s, suffix)
+        s, suffix = tostring(s or ""), tostring(suffix or "")
+        if #suffix == 0 then return true end
+        return s:sub(-#suffix) == suffix
+    end,
+    contains = function(s, needle)
+        return tostring(s or ""):find(tostring(needle or ""), 1, true) ~= nil
+    end,
+    ["repeat"] = function(s, n)
+        n = math.max(0, math.floor(num(n)))
+        return string.rep(tostring(s or ""), n)
+    end,
+    capitalize = function(s)
+        s = tostring(s or "")
+        if #s == 0 then return s end
+        return s:sub(1, 1):upper() .. s:sub(2)
+    end,
+    reverse = function(s)
+        s = tostring(s or "")
+        return s:reverse()
+    end,
+    replace = function(s, from, to)
+        s = tostring(s or "")
+        from = tostring(from or "")
+        to = tostring(to or "")
+        if from == "" then return s end
+        return (s:gsub(from:gsub("(%W)", "%%%1"), to:gsub("%%", "%%%%")))
+    end,
+    lines = function(s)
+        local out = {}
+        for line in (tostring(s or "") .. "\n"):gmatch("([^\n]*)\n") do table.insert(out, line) end
+        return out
+    end,
+    padStart = function(s, len, ch)
+        s = tostring(s or "")
+        ch = tostring(ch or " ")
+        len = math.floor(num(len))
+        while #s < len do s = ch .. s end
+        return s
+    end,
+    padEnd = function(s, len, ch)
+        s = tostring(s or "")
+        ch = tostring(ch or " ")
+        len = math.floor(num(len))
+        while #s < len do s = s .. ch end
+        return s
+    end
+}
+
+HyperionStdlib.table = {
+    keys = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for k in pairs(t) do table.insert(out, k) end
+        return out
+    end,
+    values = function(t)
+        local out = {}
+        if not isTable(t) then return out end
+        for _, v in pairs(t) do table.insert(out, v) end
+        return out
+    end,
+    merge = function(a, b)
+        local out = {}
+        if isTable(a) then for k, v in pairs(a) do out[k] = v end end
+        if isTable(b) then for k, v in pairs(b) do out[k] = v end end
+        return out
+    end,
+    copy = function(t)
+        local out = {}
+        if isTable(t) then for k, v in pairs(t) do out[k] = v end end
+        return out
+    end,
+    size = function(t)
+        if not isTable(t) then return 0 end
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        return n
+    end,
+    isEmpty = function(t)
+        if not isTable(t) then return true end
+        return next(t) == nil
+    end
+}
+
+HyperionStdlib.util = {
+    range = function(a, b, step) return HyperionStdlib.list.range(a, b, step) end,
+    identity = function(v) return v end,
+    noop = function() end
+}
+
+-- Optional ModuleScript override (named 'HyperionStdlib' beside this script).
+do
+    local module = script:FindFirstChild("HyperionStdlib")
+    if module and module:IsA("ModuleScript") then
+        local ok, loaded = pcall(require, module)
+        if ok and type(loaded) == "table" then
+            HyperionStdlib = loaded
+        end
+    end
+end
+
+return TypeInference, IntelliSense, HyperionStdlib
 end)()
 
 -- ============================================================================
@@ -4112,7 +4392,8 @@ local VM = {
     watchList = {},
     breakpointConds = {},
     initialEnv = nil,
-    documentProvider = nil
+    documentProvider = nil,
+    requireCache = {}
 }
 
 local VALID_OPCODES = {
@@ -4310,7 +4591,9 @@ function VM.init(irData, customEnv)
                 error("[Hyperion VM] Execution stopped: maximum output size (10 KB) exceeded.", 0)
             end
             if VM.onOutput and not VM.suppressOutput then VM.onOutput(outStr) end
-        end
+        end,
+        std = HyperionStdlib,
+        require = function(name) return VM.requireModule(name) end
     }
 
     if customEnv then
@@ -4837,6 +5120,49 @@ function VM.evalNode(n)
     return nil
 end
 
+
+-- ---------------------------------------------------------------------------
+-- Isolated sub-VM execution + cross-document package loading (`require`).
+-- A module document is compiled and run in a fresh sandbox; only its
+-- non-builtin, non-function globals are re-exported as the module table.
+-- ---------------------------------------------------------------------------
+local MODULE_BUILTIN_KEYS = {
+    math = true, string = true, table = true, task = true, std = true,
+    tostring = true, tonumber = true, type = true, ["print"] = true, require = true
+}
+
+function VM.runIsolated(irData)
+    local saved = {}
+    for k, v in pairs(VM) do saved[k] = v end
+    VM.init(irData, VM.initialEnv)
+    VM.suppressOutput = true
+    VM.state = "RUNNING"
+    VM.runContinuous()
+    local env = VM.environment
+    for k in pairs(VM) do VM[k] = nil end
+    for k, v in pairs(saved) do VM[k] = v end
+    return env
+end
+
+function VM.requireModule(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    if VM.requireCache[name] then return VM.requireCache[name] end
+    local provider = VM.documentProvider
+    if type(provider) ~= "function" then return nil end
+    local okDoc, doc = pcall(provider, name)
+    if not okDoc or type(doc) ~= "table" or type(doc.source) ~= "string" then return nil end
+    local okAst, ast = pcall(parseSourceToAST, doc.source, doc.lang or "EPL")
+    if not okAst or type(ast) ~= "table" then return nil end
+    local okIR, ir = pcall(HyperionIR.fromAST, ast)
+    if not okIR or type(ir) ~= "table" then return nil end
+    local env = VM.runIsolated(ir)
+    local exports = {}
+    for k, v in pairs(env) do
+        if not MODULE_BUILTIN_KEYS[k] and type(v) ~= "function" then exports[k] = v end
+    end
+    VM.requireCache[name] = exports
+    return exports
+end
 
 -- ============================================================================
 -- 14. PROFILER & SELF-TEST SUITE
@@ -5402,6 +5728,40 @@ function TestRunner.runAll()
                     if inst.a == "R9" or inst.a == "R1" then return false end
                 end
                 return true
+            end
+        },
+        {
+            name = "Standard Library: math, list & string",
+            fn = function()
+                local function runOut(src)
+                    local ast = parseSourceToAST(src, "EPL")
+                    local ir = HyperionIR.fromAST(ast)
+                    local out = {}
+                    VM.onOutput = function(s) table.insert(out, tostring(s)) end
+                    VM.init(ir)
+                    VM.runContinuous()
+                    return table.concat(out, "|")
+                end
+                return runOut("print std.math.gcd(12, 18)") == "6"
+                    and runOut("print std.list.sum(std.list.range(1, 5, 1))") == "15"
+                    and runOut('print std.string.trim("  hi  ")') == 'hi'
+            end
+        },
+        {
+            name = "Package System: require across documents",
+            fn = function()
+                VM.documentProvider = function(name)
+                    if name == "geom" then return { source = "set area = 42", lang = "EPL" } end
+                    return nil
+                end
+                VM.requireCache = {}
+                local ast = parseSourceToAST('set m = require("geom")\nprint m.area', "EPL")
+                local ir = HyperionIR.fromAST(ast)
+                local out = {}
+                VM.onOutput = function(s) table.insert(out, tostring(s)) end
+                VM.init(ir)
+                VM.runContinuous()
+                return table.concat(out, "|") == "42"
             end
         },
     }
@@ -6659,6 +7019,17 @@ local function updateInspector()
         end
     end
     inspBody.Text = table.concat(lines, "\n")
+end
+
+VM.documentProvider = function(name)
+    if type(name) ~= "string" then return nil end
+    for _, d in ipairs(docs) do
+        local base = d.name:gsub("%.[^.]+$", "")
+        if d.name == name or base == name then
+            return { source = d.text or "", lang = d.lang or "EPL" }
+        end
+    end
+    return nil
 end
 
 local function wireVMCallbacks()

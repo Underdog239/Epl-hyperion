@@ -14,6 +14,7 @@ Optional ModuleScripts (place them as children of the LocalScript):
 
 - `HyperionModules/HyperionBase64.lua` — named `HyperionBase64`; overrides the built-in Base64 codec.
 - `HyperionModules/HyperionLanguages.lua` — named `HyperionLanguages`; overrides the built-in multi-language engine.
+- `HyperionModules/HyperionStdlib.lua` — named `HyperionStdlib`; overrides the built-in `std` library.
 
 If either module is absent, Hyperion uses its own built-in implementation, so the script is fully self-contained.
 
@@ -39,12 +40,14 @@ Hyperion is a small teaching-language (**EPL**) plus a full polyglot toolchain t
 - **Lexer / Parser / AST** for all of the above.
 - **Semantic analyzer** — undefined-variable errors, unused-variable warnings, unreachable-code and `while true` loop warnings.
 - **Hyperion IR** — source-mapped pseudo-bytecode with a strict validator.
-- **Optimizer** — provably safe AST constant folding/algebraic reduction plus IR peephole optimization (dead self-move elimination with jump-target remapping).
+- **Optimizer** — provably safe AST constant folding/algebraic reduction, IR peephole optimization (dead self-move elimination with jump-target remapping) and a **CFG pass**: basic-block construction, unreachable-block elimination, intra-block copy propagation and dead pure-store elimination, all with jump-target remapping.
 - **Sandboxed VM** — call frames, closures, a hardened environment (math/string/table only), and a strict watchdog (1.0 s / 100k instructions, recursion and output caps).
+- **Standard library & packages** — every program gets a sandbox-safe `std` library (`std.math`, `std.list`, `std.string`, `std.table`, `std.util`) and a `require("name")` package loader that compiles and runs another open document in an isolated sandbox, exporting its globals.
+- **Profiler** — per-phase timings plus per-line execution counters rendered as a gutter **heatmap** (Heat toolbar toggle) with a hottest-lines report.
 - **Static type inference & IntelliSense** — a conservative type pass (number / string / bool / nil / table / function / any) that powers autocomplete (symbols, keywords, member access), hover types, go-to-definition, find-references and document-wide rename.
-- **Step debugger** — click a line number to set a breakpoint, then Step / Continue, with a live inspector (registers, call stack, environment).
+- **Debugger** — line breakpoints with optional **conditions**, Step / Continue / **Back (time-travel reverse execution)**, and a live inspector (registers, call stack, environment) with user **watch expressions**.
 - **IDE** — multi-document tabs, syntax highlighting driven by the real lexer (per language), four themes, a terminal, a Hyperion console-error viewer, and Base64 share-code export/import.
-- **Self-test suite** — 38 built-in tests (Tests button), all passing.
+- **Self-test suite** — 44 built-in tests (Tests button), all passing.
 
 ## Safety limits
 
@@ -55,3 +58,4 @@ Source ≤ 100 KB, tokens ≤ 20k, AST nodes ≤ 12k, IR ≤ 25k instructions / 
 - `EPLHyperion.client.lua` — the entire application (single LocalScript), including an embedded copy of the language engine.
 - `HyperionModules/HyperionBase64.lua` — optional Base64 ModuleScript override.
 - `HyperionModules/HyperionLanguages.lua` — optional multi-language ModuleScript override (C, C+, C++, Java, English, Bytecode, Luau).
+- `HyperionModules/HyperionStdlib.lua` — optional standard-library ModuleScript override (named `HyperionStdlib`).
