@@ -37,7 +37,19 @@ local CONFIG = {
     MAX_DOCUMENTS         = 12,       -- Max open editor documents
     EDITOR_TEXT_SIZE      = 14,       -- Editor font size in px
     MAX_INSPECTOR_REGS    = 40,       -- Max registers shown in the inspector
+    -- Owner-only tooling (Sentinel analysis / auto-patch). Everyone else gets
+    -- normal IDE execution with the Sentinel fully hidden and silent.
+    OWNER_USERNAMES       = { ["Naynaybaybay_17"] = true },
+    IS_OWNER              = false,
 }
+-- Owner gate. Resolved defensively so a missing/renamed player never errors.
+do
+    local ok, name = pcall(function() return player and player.Name end)
+    if ok and type(name) == "string" and CONFIG.OWNER_USERNAMES[name] then
+        CONFIG.IS_OWNER = true
+    end
+end
+
 
 -- ============================================================================
 -- 2. DETERMINISTIC FULL-SOURCE HASHING FOR TRANSLATION CACHE
@@ -6141,6 +6153,7 @@ local extraBtns = {
     cond   = toolBtn("Cond", C.red, 52),
     sentinel = toolBtn("Sentinel", C.green, 74)
 }
+if not CONFIG.IS_OWNER then extraBtns.sentinel.Visible = false end
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
@@ -7915,7 +7928,7 @@ local sentinelLastCount = -1
 -- nobody using the IDE sees them. They are only visible in the Sentinel panel,
 -- which the developer opens deliberately. Scanning stays purely static - the
 -- Sentinel never executes the document.
-local sentinelVerbose = false
+local sentinelVerbose = CONFIG.IS_OWNER
 local function sentinelLog(msg)
     if sentinelVerbose then log(msg) end
 end
@@ -8032,14 +8045,16 @@ local function sentinelOpen()
     render()
 end
 
-extraBtns.sentinel.Activated:Connect(safeAction("Sentinel", sentinelOpen))
+if CONFIG.IS_OWNER then
+    extraBtns.sentinel.Activated:Connect(safeAction("Sentinel", sentinelOpen))
+end
 
 -- Background autopilot: keeps watching the active document, reports the health
 -- score, and AUTOMATICALLY applies auto-safe fixes with no button press. It only
 -- ever runs while the editor is unfocused and the text is stable, and every edit
 -- still has to pass the module's hard budget guards. The original source is kept
 -- for Undo.
-local sentinelAutoEnabled = true
+local sentinelAutoEnabled = CONFIG.IS_OWNER
 local sentinelAutoKey = nil
 
 local function sentinelAutoTick()
@@ -8076,7 +8091,7 @@ local function sentinelAutoTick()
     end
 end
 
-if SentinelEngine then
+if SentinelEngine and CONFIG.IS_OWNER then
     editor.FocusLost:Connect(function()
         task.defer(function() pcall(sentinelAutoTick) end)
     end)
