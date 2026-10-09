@@ -3437,6 +3437,420 @@ local function translateSource(src, fromLang, toLang)
     return result
 end
 
+local TypeInference, IntelliSense = (function()
+-- ============================================================================
+-- 12b. STATIC TYPE INFERENCE & INTELLISENSE ENGINE
+--     A conservative, purely client-side type-inference pass that annotates
+--     every expression with number / string / bool / nil / table / function /
+--     any. It powers IDE code intelligence: completion, hover types,
+--     go-to-definition, references and rename. No new Roblox services are used
+--     and all diagnostics are WARNING-level so they never block compilation.
+-- ============================================================================
+
+local TypeSystem = {}
+local TYPE_ANY = "any"
+local TYPE_UNKNOWN = "unknown"
+
+-- Least-upper-bound join of two inferred types (a small union model).
+function TypeSystem.join(a, b)
+    if a == nil or a == TYPE_UNKNOWN then return b or TYPE_UNKNOWN end
+    if b == nil or b == TYPE_UNKNOWN then return a end
+    if a == b then return a end
+    return TYPE_ANY
+end
+
+-- Builtin global -> inferred type (return type for functions, table for modules).
+local BUILTIN_TYPES = {
+    ["print"] = "nil", ["warn"] = "nil", ["error"] = "nil", ["assert"] = "any",
+    ["pcall"] = "any", ["xpcall"] = "any", ["select"] = "any", ["tostring"] = "string",
+    ["tonumber"] = "number", ["type"] = "string", ["typeof"] = "string",
+    ["pairs"] = "table", ["ipairs"] = "table", ["next"] = "any", ["rawget"] = "any",
+    ["rawset"] = "table", ["setmetatable"] = "table", ["getmetatable"] = "table",
+    ["string"] = "table", ["table"] = "table", ["math"] = "table", ["task"] = "table",
+    ["game"] = "table", ["workspace"] = "table", ["script"] = "table", ["os"] = "table",
+}
+
+-- Member return types for the most common standard-library modules.
+local MEMBER_RETURNS = {
+    math = { abs = "number", ceil = "number", floor = "number", sqrt = "number",
+        max = "number", min = "number", random = "number", pow = "number",
+        sin = "number", cos = "number", tan = "number", round = "number",
+        clamp = "number", pi = "number", huge = "number" },
+    string = { len = "number", byte = "number", find = "number", format = "string",
+        sub = "string", upper = "string", lower = "string", rep = "string",
+        reverse = "string", gsub = "string", char = "string" },
+    table = { concat = "string" },
+}
+
+-- Candidate members offered by completion for modules / value types.
+local MEMBER_LISTS = {
+    math = { "abs", "ceil", "floor", "sqrt", "max", "min", "random", "pow",
+        "sin", "cos", "tan", "round", "clamp", "pi", "huge" },
+    string = { "format", "sub", "len", "upper", "lower", "rep", "reverse",
+        "find", "gsub", "byte", "char" },
+    table = { "insert", "remove", "concat", "sort", "unpack", "pack", "find" },
+    task = { "wait", "delay", "spawn", "defer" },
+    game = { "GetService", "Players", "Workspace", "HttpService" },
+}
+
+function TypeSystem.memberReturn(moduleName, member)
+    local t = moduleName and MEMBER_RETURNS[moduleName]
+    if t and t[member] then return t[member] end
+    return TYPE_ANY
+end
+
+function TypeSystem.valueMembers(t)
+    if t == "string" then return MEMBER_LISTS.string end
+    if t == "table" then return MEMBER_LISTS.table end
+    if t == "number" then return MEMBER_LISTS.math end
+    return {}
+end
+
+-- --- Type inference pass ----------------------------------------------------
+local TypeInference = {}
+
+-- Infer types for an AST. Returns
+--   { diagnostics = {...}, symbols = {...}, nodeTypes = { [node] = type },
+--     globals = { name = type } }
+function TypeInference.infer(ast)
+    local diagnostics, symbols, nodeTypes, globals = {}, {}, {}, {}
+    local scopeStack = { {} }
+
+    local function pushScope() table.insert(scopeStack, {}) end
+    local function popScope() table.remove(scopeStack) end
+
+    local function lookup(name)
+        for i = #scopeStack, 1, -1 do
+            local s = scopeStack[i][name]
+            if s then return s end
+        end
+        return nil
+    end
+
+    local function declare(name, kind, ty, line, col)
+        if not name or name == "" then return end
+        scopeStack[#scopeStack][name] = { name = name, kind = kind, type = ty or TYPE_UNKNOWN, line = line or 1, col = col or 1 }
+        table.insert(symbols, { name = name, kind = kind, type = ty or TYPE_UNKNOWN, line = line or 1, col = col or 1 })
+        if #scopeStack == 1 then globals[name] = ty or TYPE_UNKNOWN end
+    end
+
+    local function diag(code, message, node)
+        table.insert(diagnostics, {
+            code = code, severity = "WARNING", stage = "Types", message = message,
+            line = (node and node.line) or 1, col = (node and node.col) or 1
+        })
+    end
+
+    local inferExpr
+
+    local function inferBinary(n)
+        local lt, rt = inferExpr(n.left), inferExpr(n.right)
+        local op = n.op
+        if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" or op == "^" then
+            if lt == "bool" or rt == "bool" then
+                diag("TYP-001", "Arithmetic operator '" .. op .. "' used on a boolean value", n)
+            elseif lt == "string" or rt == "string" then
+                diag("TYP-002", "Arithmetic operator '" .. op .. "' used on a string value", n)
+            end
+            return "number"
+        elseif op == ".." then
+            if lt == "bool" or rt == "bool" then
+                diag("TYP-003", "String concatenation of a boolean value", n)
+            end
+            return "string"
+        elseif op == "==" or op == "~=" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" then
+            return "bool"
+        elseif op == "and" or op == "or" then
+            return TypeSystem.join(lt, rt)
+        end
+        return TYPE_UNKNOWN
+    end
+
+    inferExpr = function(n)
+        if not n then return TYPE_UNKNOWN end
+        local tag = n.tag
+        local result = TYPE_UNKNOWN
+        if tag == "number" then result = "number"
+        elseif tag == "string" then result = "string"
+        elseif tag == "bool" then result = "bool"
+        elseif tag == "nil" then result = "nil"
+        elseif tag == "ident" then
+            local s = lookup(n.name)
+            if s then result = s.type
+            elseif BUILTIN_TYPES[n.name] then result = BUILTIN_TYPES[n.name]
+            else result = TYPE_ANY end
+        elseif tag == "unary" then
+            inferExpr(n.operand)
+            result = (n.op == "not" or n.op == "!") and "bool" or "number"
+        elseif tag == "binary" then
+            result = inferBinary(n)
+        elseif tag == "member" then
+            local ot = inferExpr(n.object)
+            local moduleName = (n.object and n.object.tag == "ident") and n.object.name or nil
+            if ot ~= "table" and ot ~= TYPE_ANY and ot ~= TYPE_UNKNOWN and ot ~= nil then
+                diag("TYP-004", "Member access on a value of type '" .. tostring(ot) .. "'", n)
+            end
+            result = TypeSystem.memberReturn(moduleName, n.member)
+        elseif tag == "call" then
+            if n.callee and n.callee.tag == "member" then
+                inferExpr(n.callee.object)
+                local moduleName = (n.callee.object and n.callee.object.tag == "ident") and n.callee.object.name or nil
+                result = TypeSystem.memberReturn(moduleName, n.callee.member)
+            else
+                local ct = inferExpr(n.callee)
+                if ct ~= "function" and ct ~= TYPE_ANY and ct ~= TYPE_UNKNOWN and ct ~= nil then
+                    diag("TYP-005", "Attempt to call a value of type '" .. tostring(ct) .. "'", n)
+                end
+                result = TYPE_ANY
+            end
+            for _, a in ipairs(n.args or {}) do inferExpr(a) end
+        end
+        nodeTypes[n] = result
+        return result
+    end
+
+    local inferStatements
+    inferStatements = function(stmts)
+        for _, stmt in ipairs(stmts or {}) do
+            local tag = stmt.tag
+            if tag == "set" then
+                declare(stmt.name, "variable", inferExpr(stmt.expr), stmt.line, stmt.col)
+            elseif tag == "function" then
+                declare(stmt.name, "function", "function", stmt.line, stmt.col)
+                pushScope()
+                for _, p in ipairs(stmt.params or {}) do declare(p, "parameter", TYPE_ANY, stmt.line, stmt.col) end
+                inferStatements(stmt.body)
+                popScope()
+            elseif tag == "for" then
+                inferExpr(stmt.start); inferExpr(stmt.limit); inferExpr(stmt.step)
+                pushScope()
+                if not stmt.hidden then declare(stmt.var, "variable", "number", stmt.line, stmt.col) end
+                inferStatements(stmt.body)
+                popScope()
+            elseif tag == "if" then
+                inferExpr(stmt.cond)
+                pushScope(); inferStatements(stmt.thenBody); popScope()
+                pushScope(); inferStatements(stmt.elseBody); popScope()
+            elseif tag == "while" then
+                inferExpr(stmt.cond)
+                pushScope(); inferStatements(stmt.body); popScope()
+            elseif tag == "return" then
+                inferExpr(stmt.expr)
+            elseif tag == "print" or tag == "calculate" or tag == "wait" then
+                inferExpr(stmt.expr)
+                for _, a in ipairs(stmt.args or {}) do inferExpr(a) end
+            elseif tag == "expr_stmt" then
+                inferExpr(stmt.expr)
+            end
+        end
+    end
+
+    inferStatements(ast and ast.body or {})
+    return { diagnostics = diagnostics, symbols = symbols, nodeTypes = nodeTypes, globals = globals }
+end
+
+-- --- IntelliSense: completion, hover, definition, references, rename --------
+local IntelliSense = { _cache = { key = nil, lang = nil, data = nil } }
+
+local function buildLineStarts(src)
+    local starts = { 1 }
+    local pos = 1
+    while true do
+        local nl = src:find("\n", pos, true)
+        if not nl then break end
+        table.insert(starts, nl + 1)
+        pos = nl + 1
+    end
+    return starts
+end
+
+local function languageKeywords(lang)
+    local list = {}
+    local set
+    if lang == "EPL" then set = EPL_KEYWORDS
+    elseif lang == "Python" then set = PY_KEYWORDS
+    elseif lang == "English" then set = HyperionLanguages.ENGLISH_KEYWORDS
+    elseif C_FAMILY[lang] then set = HyperionLanguages.CXX_KEYWORDS
+    elseif lang == "Bytecode" then
+        for _, op in ipairs(HyperionLanguages.BYTECODE_OPCODES or {}) do table.insert(list, op) end
+        return list
+    else set = LUA_KEYWORDS end
+    for k in pairs(set or {}) do table.insert(list, k) end
+    table.sort(list)
+    return list
+end
+
+-- Analyze a source buffer once and cache the result by (source, lang) hash.
+function IntelliSense.analyze(source, lang)
+    lang = lang or "EPL"
+    local key = hashSource(source, lang, "IS")
+    local cache = IntelliSense._cache
+    if cache.key == key and cache.lang == lang then return cache.data end
+
+    local data = { source = source, lang = lang, tokens = {}, ast = nil,
+        diagnostics = {}, symbols = {}, nodeTypes = {}, ok = false }
+
+    local okTok, tokens = pcall(Lexer.lex, source, lang)
+    if okTok and type(tokens) == "table" then data.tokens = tokens end
+
+    local okAst, ast = pcall(parseSourceToAST, source, lang)
+    if okAst and type(ast) == "table" then
+        data.ast = ast
+        data.ok = true
+        local okSem, semDiags = pcall(SemanticAnalyzer.analyze, ast)
+        if okSem and type(semDiags) == "table" then
+            for _, d in ipairs(semDiags) do table.insert(data.diagnostics, d) end
+        end
+        local okTypes, tr = pcall(TypeInference.infer, ast)
+        if okTypes and type(tr) == "table" then
+            data.nodeTypes = tr.nodeTypes or {}
+            data.symbols = tr.symbols or {}
+            for _, d in ipairs(tr.diagnostics or {}) do table.insert(data.diagnostics, d) end
+        end
+    end
+
+    -- Fallback: derive a symbol list from the token stream if parsing failed.
+    if #data.symbols == 0 then
+        local seen = {}
+        for _, t in ipairs(data.tokens) do
+            if t.kind == "IDENT" and not seen[t.value] then
+                seen[t.value] = true
+                table.insert(data.symbols, { name = t.value, kind = "identifier", type = TYPE_ANY, line = t.line, col = t.col })
+            end
+        end
+    end
+
+    cache.key, cache.lang, cache.data = key, lang, data
+    return data
+end
+
+function IntelliSense.typeOfName(data, name)
+    if not name then return nil end
+    if BUILTIN_TYPES[name] then return BUILTIN_TYPES[name] end
+    for _, s in ipairs(data.symbols or {}) do
+        if s.name == name then return s.type end
+    end
+    return nil
+end
+
+local function tokenAt(tokens, line, col)
+    for _, t in ipairs(tokens) do
+        if t.line == line then
+            local c0 = t.col or 1
+            local c1 = c0 + #tostring(t.value) - 1
+            if col >= c0 and col <= c1 then return t end
+        elseif t.line and t.line > line then
+            break
+        end
+    end
+    return nil
+end
+
+-- Completion. Detects member access (after '.') vs. symbol/keyword completion.
+function IntelliSense.complete(source, line, col, lang)
+    local data = IntelliSense.analyze(source, lang)
+    local starts = buildLineStarts(source)
+    local lineStart = starts[line] or 1
+    local before = source:sub(lineStart, lineStart + col - 2)
+    local word = before:match("([%a_][%w_]*)$") or ""
+    local prefixStartCol = col - #word
+    local items, seen = {}, {}
+
+    local function add(label, kind, ty)
+        if not label or seen[label] then return end
+        seen[label] = true
+        table.insert(items, { label = label, kind = kind, type = ty or "" })
+    end
+
+    if before:match("%.$") then
+        local base = before:match("([%a_][%w_]*)%.$")
+        local members = MEMBER_LISTS[base or ""]
+        if not members then members = TypeSystem.valueMembers(IntelliSense.typeOfName(data, base)) end
+        for _, m in ipairs(members or {}) do add(m, "member", "any") end
+        return { items = items, prefix = word, prefixStartCol = prefixStartCol, mode = "member" }
+    end
+
+    for _, kw in ipairs(languageKeywords(lang)) do add(kw, "keyword", "") end
+    for _, s in ipairs(data.symbols or {}) do add(s.name, s.kind or "variable", s.type) end
+    for name, ty in pairs(BUILTIN_TYPES) do add(name, "builtin", ty) end
+
+    local lower = word:lower()
+    local filtered = {}
+    for _, it in ipairs(items) do
+        if lower == "" or it.label:lower():sub(1, #lower) == lower then
+            table.insert(filtered, it)
+        end
+        if #filtered >= 100 then break end
+    end
+    return { items = filtered, prefix = word, prefixStartCol = prefixStartCol, mode = "symbol" }
+end
+
+function IntelliSense.hover(source, line, col, lang)
+    local data = IntelliSense.analyze(source, lang)
+    local tok = tokenAt(data.tokens, line, col)
+    if not tok or tok.kind ~= "IDENT" then return nil end
+    local decl
+    for _, s in ipairs(data.symbols or {}) do
+        if s.name == tok.value then decl = s; break end
+    end
+    return {
+        name = tok.value,
+        type = decl and decl.type or (BUILTIN_TYPES[tok.value] or TYPE_ANY),
+        kind = decl and decl.kind or "identifier",
+        line = decl and decl.line or nil,
+        col = decl and decl.col or nil
+    }
+end
+
+function IntelliSense.definition(source, line, col, lang)
+    local data = IntelliSense.analyze(source, lang)
+    local tok = tokenAt(data.tokens, line, col)
+    if not tok or tok.kind ~= "IDENT" then return nil end
+    for _, s in ipairs(data.symbols or {}) do
+        if s.name == tok.value then return { name = s.name, line = s.line, col = s.col, type = s.type } end
+    end
+    return nil
+end
+
+function IntelliSense.references(source, line, col, lang)
+    local data = IntelliSense.analyze(source, lang)
+    local tok = tokenAt(data.tokens, line, col)
+    if not tok or tok.kind ~= "IDENT" then return nil end
+    local refs = {}
+    for _, t in ipairs(data.tokens) do
+        if t.kind == "IDENT" and t.value == tok.value then
+            table.insert(refs, { line = t.line, col = t.col })
+        end
+    end
+    return { name = tok.value, refs = refs }
+end
+
+function IntelliSense.rename(source, line, col, newName, lang)
+    if type(newName) ~= "string" or not newName:match("^[%a_][%w_]*$") then
+        return nil, "Invalid identifier"
+    end
+    local data = IntelliSense.analyze(source, lang)
+    local tok = tokenAt(data.tokens, line, col)
+    if not tok or tok.kind ~= "IDENT" then return nil, "No identifier at cursor" end
+    if tok.value == newName then return source, 0 end
+    local starts = buildLineStarts(source)
+    local edits = {}
+    for _, t in ipairs(data.tokens) do
+        if t.kind == "IDENT" and t.value == tok.value then
+            local start = (starts[t.line] or 1) + (t.col or 1) - 1
+            table.insert(edits, { start = start, len = #t.value })
+        end
+    end
+    table.sort(edits, function(a, b) return a.start > b.start end)
+    local out = source
+    for _, e in ipairs(edits) do
+        out = out:sub(1, e.start - 1) .. newName .. out:sub(e.start + e.len)
+    end
+    return out, #edits
+end
+return TypeInference, IntelliSense
+end)()
+
 -- ============================================================================
 -- 13. HARDENED SANDBOXED VM (Call Frames, Scopes, Strict Watchdog, Debugger)
 -- ============================================================================
@@ -4479,7 +4893,48 @@ function TestRunner.runAll()
                 VM.runContinuous()
                 return VM.state == "HALTED"
             end
-        }
+        },
+        {
+            name = "Type Inference: Literals & Arithmetic",
+            fn = function()
+                local ast = parseSourceToAST("set n = 1 + 2 * 3\nset s = \"a\" .. \"b\"\nset b = n > 2\nprint s", "EPL")
+                local r = TypeInference.infer(ast)
+                local types = {}
+                for _, sym in ipairs(r.symbols) do types[sym.name] = sym.type end
+                return types.n == "number" and types.s == "string" and types.b == "bool"
+            end
+        },
+        {
+            name = "Type Inference: Function & Parameter Symbols",
+            fn = function()
+                local ast = parseSourceToAST("local function add(a, b)\n    return a + b\nend\nset r = add(1, 2)", "Lua")
+                local r = TypeInference.infer(ast)
+                local kinds = {}
+                for _, sym in ipairs(r.symbols) do kinds[sym.name] = sym.kind end
+                return kinds.add == "function" and kinds.a == "parameter" and kinds.r == "variable"
+            end
+        },
+        {
+            name = "IntelliSense: Completion & Go-To-Definition",
+            fn = function()
+                local src = "set counter = 10\nprint counter"
+                local res = IntelliSense.complete(src, 2, 14, "EPL")
+                local found = false
+                for _, it in ipairs(res.items) do if it.label == "counter" then found = true end end
+                local def = IntelliSense.definition(src, 2, 7, "EPL")
+                return found and def ~= nil and def.name == "counter" and def.line == 1
+            end
+        },
+        {
+            name = "IntelliSense: Rename References",
+            fn = function()
+                local src = "set total = 1\nset sum = total + total\nprint total"
+                local out, count = IntelliSense.rename(src, 2, 11, "grand")
+                return out ~= nil and count == 4
+                    and out:find("grand", 1, true) ~= nil
+                    and out:find("total", 1, true) == nil
+            end
+        },
     }
 
     local passed = 0
@@ -4794,6 +5249,8 @@ local targetBtn = toolBtn("Target: Luau", C.text, 100)
 local testBtn   = toolBtn("Tests", C.cyan, 60)
 local clearBtn  = toolBtn("Clear", C.muted, 56)
 local errorsBtn = toolBtn("Errors", C.red, 64)
+local defBtn    = toolBtn("Go Def", C.cyan, 62)
+local renameBtn = toolBtn("Rename", C.purple, 66)
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     toolbarScroll.CanvasSize = UDim2.new(0, toolbarLayout.AbsoluteContentSize.X + 12, 0, 0)
@@ -5607,6 +6064,8 @@ local function refreshTheme()
     testBtn.TextColor3 = C.cyan
     clearBtn.TextColor3 = C.muted
     errorsBtn.TextColor3 = C.red
+    defBtn.TextColor3 = C.cyan
+    renameBtn.TextColor3 = C.purple
     statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
     rebuildTabs()
@@ -6120,6 +6579,297 @@ UIS.InputChanged:Connect(function(input)
         root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 end)
+
+do
+-- ============================================================================
+-- 24b. INTELLISENSE UI (completion popup, hover types, go-to-definition, rename)
+-- ============================================================================
+
+-- Returns (line, col, textBeforeCaret) for the current editor caret.
+local function caretLineCol()
+    local pos = editor.CursorPosition or 1
+    if pos < 1 then pos = 1 end
+    local before = editor.Text:sub(1, pos - 1)
+    local ln = 1 + select(2, before:gsub("\n", "\n"))
+    local lastNl = 0
+    local from = 0
+    while true do
+        local p = before:find("\n", from + 1, true)
+        if p then lastNl = p; from = p else break end
+    end
+    return ln, pos - lastNl, before
+end
+
+local function absoluteOffset(source, line, col)
+    local starts = { 1 }
+    local pos = 1
+    while true do
+        local nl = source:find("\n", pos, true)
+        if not nl then break end
+        table.insert(starts, nl + 1)
+        pos = nl + 1
+    end
+    return (starts[line] or 1) + (col or 1) - 1
+end
+
+-- ---- Completion popup ------------------------------------------------------
+local completionPopup = mk("Frame", {
+    BackgroundColor3 = C.panel, BorderSizePixel = 0, Visible = false, ZIndex = 80
+}, root)
+corner(completionPopup, 6)
+stroke(completionPopup, C.cyan)
+local completionList = mk("ScrollingFrame", {
+    Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 3, CanvasSize = UDim2.new()
+}, completionPopup)
+mk("UIListLayout", { Padding = UDim.new(0, 1) }, completionList)
+
+local completionState = { items = {}, index = 1, prefixLen = 0, open = false }
+local completionRows = {}
+
+local function hideCompletion()
+    completionState.open = false
+    completionPopup.Visible = false
+    for _, b in ipairs(completionRows) do b:Destroy() end
+    completionRows = {}
+end
+
+local function acceptCompletion()
+    if not completionState.open then return end
+    local item = completionState.items[completionState.index]
+    if not item then return end
+    local pos = editor.CursorPosition or 1
+    local startPos = math.max(1, pos - completionState.prefixLen)
+    editor.Text = editor.Text:sub(1, startPos - 1) .. item.label .. editor.Text:sub(pos)
+    editor.CursorPosition = startPos + #item.label
+    editor.SelectionStart = editor.CursorPosition
+    hideCompletion()
+    markDirty()
+    buildGutter()
+    scheduleHighlight()
+end
+
+local function renderCompletion()
+    for _, b in ipairs(completionRows) do b:Destroy() end
+    completionRows = {}
+    local n = math.min(#completionState.items, 9)
+    for i = 1, n do
+        local item = completionState.items[i]
+        local selected = (i == completionState.index)
+        local row = mk("TextButton", {
+            Size = UDim2.new(1, 0, 0, 18),
+            BackgroundColor3 = selected and C.selection or C.panel2,
+            BackgroundTransparency = selected and 0 or 1,
+            BorderSizePixel = 0,
+            Text = "  " .. item.label .. (item.type ~= "" and ("   : " .. item.type) or ""),
+            TextColor3 = selected and C.text or C.muted,
+            TextSize = 11, Font = Enum.Font.Code,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            AutoButtonColor = false, LayoutOrder = i
+        }, completionList)
+        row.Activated:Connect(function()
+            completionState.index = i
+            acceptCompletion()
+        end)
+        completionRows[i] = row
+    end
+    completionList.CanvasSize = UDim2.new(0, 0, 0, math.max(#completionRows * 19, 1))
+end
+
+local function refreshCompletion(force)
+    if not editor:IsFocused() then hideCompletion(); return end
+    local ln, col = caretLineCol()
+    local ok, result = pcall(IntelliSense.complete, editor.Text, ln, col, docLang())
+    if not ok or type(result) ~= "table" or #result.items == 0 then hideCompletion(); return end
+    if not force and #result.prefix == 0 and result.mode ~= "member" then hideCompletion(); return end
+    completionState.items = result.items
+    completionState.index = 1
+    completionState.prefixLen = #result.prefix
+    completionState.open = true
+    completionPopup.Visible = true
+    renderCompletion()
+
+    local pos = editor.CursorPosition or 1
+    local linePrefix = editor.Text:sub(1, pos - 1):match("([^\n]*)$") or ""
+    local w = TextService:GetTextSize(linePrefix, CONFIG.EDITOR_TEXT_SIZE, Enum.Font.Code, Vector2.new(4000, 60)).X
+    local relX = (editor.AbsolutePosition.X + w) - root.AbsolutePosition.X
+    local relY = (editor.AbsolutePosition.Y + (ln - 1) * LINE_HEIGHT + LINE_HEIGHT) - root.AbsolutePosition.Y
+    relX = math.clamp(relX, 0, math.max(0, root.AbsoluteSize.X - 230))
+    relY = math.clamp(relY, 0, math.max(0, root.AbsoluteSize.Y - 120))
+    completionPopup.Position = UDim2.fromOffset(relX, relY)
+    completionPopup.Size = UDim2.fromOffset(226, math.min(#completionState.items, 9) * 19 + 4)
+end
+
+local function moveCompletion(delta)
+    if not completionState.open then return end
+    local n = math.min(#completionState.items, 9)
+    if n > 0 then
+        completionState.index = ((completionState.index - 1 + delta) % n) + 1
+        renderCompletion()
+    end
+end
+
+-- ---- Hover tooltip ---------------------------------------------------------
+local hoverTip = mk("Frame", {
+    BackgroundColor3 = C.panel, BorderSizePixel = 0, Visible = false, ZIndex = 85,
+    Size = UDim2.fromOffset(270, 56)
+}, root)
+corner(hoverTip, 6)
+stroke(hoverTip, C.purple)
+local hoverLabel = mk("TextLabel", {
+    Position = UDim2.fromOffset(7, 4), Size = UDim2.new(1, -14, 1, -8),
+    BackgroundTransparency = 1, Text = "", TextColor3 = C.text, TextSize = 11,
+    Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true
+}, hoverTip)
+
+local function hideHover() hoverTip.Visible = false end
+
+local function hoverAtMouse()
+    local loc = UIS:GetMouseLocation()
+    local rx = loc.X - editor.AbsolutePosition.X
+    local ry = loc.Y - editor.AbsolutePosition.Y
+    if rx < 0 or ry < 0 or rx > editor.AbsoluteSize.X or ry > editor.AbsoluteSize.Y then
+        hideHover(); return
+    end
+    local line = math.floor(ry / LINE_HEIGHT) + 1
+    local charW = math.max(1, TextService:GetTextSize("0", CONFIG.EDITOR_TEXT_SIZE, Enum.Font.Code, Vector2.new(4000, 60)).X)
+    local col = math.floor(rx / charW) + 1
+    local ok, info = pcall(IntelliSense.hover, editor.Text, line, col, docLang())
+    if not ok or not info then hideHover(); return end
+    local where = info.line and string.format("  (line %d)", info.line) or ""
+    hoverLabel.Text = string.format("%s : %s  [%s]%s", info.name, info.type, info.kind, where)
+    local relX = loc.X - root.AbsolutePosition.X + 14
+    local relY = loc.Y - root.AbsolutePosition.Y + 16
+    relX = math.clamp(relX, 0, math.max(0, root.AbsoluteSize.X - 280))
+    relY = math.clamp(relY, 0, math.max(0, root.AbsoluteSize.Y - 66))
+    hoverTip.Position = UDim2.fromOffset(relX, relY)
+    hoverTip.Visible = true
+end
+
+
+-- ---- Go to definition ------------------------------------------------------
+local function gotoDefinitionAtCursor()
+    local ln, col = caretLineCol()
+    local ok, def = pcall(IntelliSense.definition, editor.Text, ln, col, docLang())
+    if not ok or not def then
+        log("[IntelliSense] No definition found for the symbol at the cursor.")
+        return
+    end
+    local offset = absoluteOffset(editor.Text, def.line, def.col)
+    editor.CursorPosition = offset
+    editor.SelectionStart = offset
+    log(string.format("[IntelliSense] '%s' defined at line %d, col %d.", def.name, def.line, def.col))
+end
+
+-- ---- Rename symbol ---------------------------------------------------------
+local renamePanel
+local function openRenameDialog()
+    local ln, col = caretLineCol()
+    local ok, info = pcall(IntelliSense.hover, editor.Text, ln, col, docLang())
+    if not ok or not info then
+        log("[IntelliSense] Place the cursor on an identifier to rename it.")
+        return
+    end
+    if renamePanel then renamePanel:Destroy() end
+    renamePanel = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(380, 156), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ZIndex = 90
+    }, root)
+    corner(renamePanel, 8)
+    stroke(renamePanel, C.purple)
+    mk("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 10),
+        Size = UDim2.new(1, -24, 0, 20), Text = "RENAME SYMBOL", TextColor3 = C.purple,
+        TextSize = 13, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91
+    }, renamePanel)
+    local box = mk("TextBox", {
+        Position = UDim2.fromOffset(12, 38), Size = UDim2.new(1, -24, 0, 28),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = info.name,
+        TextColor3 = C.text, TextSize = 13, Font = Enum.Font.Code,
+        ClearTextOnFocus = false, ZIndex = 91
+    }, renamePanel)
+    corner(box, 5)
+    local statusLbl = mk("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 72),
+        Size = UDim2.new(1, -24, 0, 18), Text = "Renames every reference in this document.",
+        TextColor3 = C.muted, TextSize = 11, Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 91
+    }, renamePanel)
+    local okBtn = button(renamePanel, "Rename", C.green)
+    okBtn.Position = UDim2.fromOffset(12, 110); okBtn.Size = UDim2.fromOffset(120, 28); okBtn.ZIndex = 91
+    local cancelBtn = button(renamePanel, "Cancel", C.muted)
+    cancelBtn.Position = UDim2.fromOffset(142, 110); cancelBtn.Size = UDim2.fromOffset(100, 28); cancelBtn.ZIndex = 91
+
+    cancelBtn.Activated:Connect(function()
+        if renamePanel then renamePanel:Destroy(); renamePanel = nil end
+    end)
+    okBtn.Activated:Connect(safeAction("Rename", function()
+        local newName = box.Text
+        local okR, newSource, count = pcall(IntelliSense.rename, editor.Text, ln, col, newName, docLang())
+        if not okR or not newSource then
+            statusLbl.Text = "Rename failed: " .. tostring(count or "unknown error")
+            statusLbl.TextColor3 = C.red
+            return
+        end
+        if count == 0 then
+            statusLbl.Text = "Nothing to rename."
+            statusLbl.TextColor3 = C.red
+            return
+        end
+        editor.Text = newSource
+        markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
+        log(string.format("[IntelliSense] Renamed '%s' -> '%s' (%d occurrence%s).", info.name, newName, count, count == 1 and "" or "s"))
+        if renamePanel then renamePanel:Destroy(); renamePanel = nil end
+    end))
+    box:CaptureFocus()
+    box.SelectionStart = 1
+    box.CursorPosition = #info.name + 1
+end
+
+-- ---- Event wiring ----------------------------------------------------------
+defBtn.Activated:Connect(safeAction("GoToDefinition", gotoDefinitionAtCursor))
+renameBtn.Activated:Connect(safeAction("RenameSymbol", openRenameDialog))
+
+editor:GetPropertyChangedSignal("CursorPosition"):Connect(function()
+    if completionState.open then pcall(refreshCompletion, false) end
+end)
+
+editor:GetPropertyChangedSignal("Text"):Connect(function()
+    task.defer(function() pcall(refreshCompletion, false) end)
+end)
+
+editor.FocusLost:Connect(function()
+    hideCompletion()
+    hideHover()
+end)
+
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if not editor:IsFocused() then return end
+    local key = input.KeyCode
+    if completionState.open then
+        if key == Enum.KeyCode.Down then
+            moveCompletion(1)
+        elseif key == Enum.KeyCode.Up then
+            moveCompletion(-1)
+        elseif key == Enum.KeyCode.Tab then
+            acceptCompletion()
+        elseif key == Enum.KeyCode.Escape then
+            hideCompletion()
+        end
+    elseif key == Enum.KeyCode.Space and UIS:IsKeyDown(Enum.KeyCode.LeftControl) then
+        refreshCompletion(true)
+    end
+end)
+
+UIS.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    if dragging or completionState.open or renamePanel then hideHover(); return end
+    pcall(hoverAtMouse)
+end)
+end
 
 -- ============================================================================
 -- 25. INITIALIZATION
