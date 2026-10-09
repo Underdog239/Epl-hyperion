@@ -6138,7 +6138,8 @@ local extraBtns = {
     heat   = toolBtn("Heat", C.yellow, 52),
     back   = toolBtn("Back", C.cyan, 54),
     watch  = toolBtn("Watch", C.purple, 62),
-    cond   = toolBtn("Cond", C.red, 52)
+    cond   = toolBtn("Cond", C.red, 52),
+    sentinel = toolBtn("Sentinel", C.green, 74)
 }
 
 toolbarLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
@@ -6960,6 +6961,7 @@ local function refreshTheme()
     extraBtns.back.TextColor3 = C.cyan
     extraBtns.watch.TextColor3 = C.purple
     extraBtns.cond.TextColor3 = C.red
+    extraBtns.sentinel.TextColor3 = C.green
     statusLabel.Text = "Theme: " .. currentThemeName .. "  |  " .. docLang() .. " → " .. targetLanguages[targetIndex]
     if applyMajorUIRevamp then applyMajorUIRevamp() end
     rebuildTabs()
@@ -7886,6 +7888,171 @@ UIS.InputChanged:Connect(function(input)
     if dragging or completionState.open or renamePanel then hideHover(); return end
     pcall(hoverAtMouse)
 end)
+end
+
+do
+
+-- ---- Sentinel: self-wiring static analysis + conservative auto-patch ------
+-- The Sentinel module is auto-detected beside this script. If it is absent the
+-- button explains how to install it; everything else in Hyperion keeps working.
+local SentinelEngine = nil
+do
+    local module = script:FindFirstChild("HyperionSentinel")
+    if module and module:IsA("ModuleScript") then
+        local ok, loaded = pcall(require, module)
+        if ok and type(loaded) == "table" and type(loaded.scan) == "function" then
+            SentinelEngine = loaded
+        end
+    end
+end
+
+local sentinelPanel
+local sentinelBackup = {}   -- [docIndex] = source before the last auto-fix (undo)
+local sentinelLastKey = nil
+local sentinelLastCount = -1
+
+local function sentinelScan()
+    if not SentinelEngine then return nil end
+    local src = editor.Text or ""
+    return SentinelEngine.scan(src, docLang(), {
+        hostDiagnostics = function(source, lang)
+            local ok, ast = pcall(parseSourceToAST, source, lang)
+            if not ok or not ast then return {} end
+            local okSem, diags = pcall(SemanticAnalyzer.analyze, ast)
+            if okSem and type(diags) == "table" then return diags end
+            return {}
+        end,
+    })
+end
+
+local function sentinelApplySafe()
+    if not SentinelEngine then
+        log("[Sentinel] HyperionSentinel module not found - install HyperionModules/HyperionSentinel.lua.")
+        return
+    end
+    local src = editor.Text or ""
+    local patches = SentinelEngine.proposeFixes(src, docLang(), {})
+    if #patches == 0 then
+        log("[Sentinel] No auto-safe fixes available for this document.")
+        return
+    end
+    local newSource, statsOrReason = SentinelEngine.apply(src, docLang(), patches, {
+        parseFn = function(text, lang)
+            local ok, ast = pcall(parseSourceToAST, text, lang)
+            return ok and ast ~= nil
+        end,
+    })
+    if not newSource then
+        log("[Sentinel] Refused to patch (guard tripped): " .. tostring(statsOrReason))
+        return
+    end
+    sentinelBackup[currentDoc] = src
+    editor.Text = newSource
+    markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
+    log(string.format("[Sentinel] Applied %d safe fix(es): %d line(s) changed, %.1f%% of the file retained.",
+        statsOrReason.hunks, statsOrReason.added + statsOrReason.removed, statsOrReason.retainedPercent))
+end
+
+local function sentinelUndo()
+    local saved = sentinelBackup[currentDoc]
+    if not saved then
+        log("[Sentinel] Nothing to undo.")
+        return
+    end
+    editor.Text = saved
+    sentinelBackup[currentDoc] = nil
+    markDirty(); buildGutter(); rebuildHighlight(); updateStatusBar()
+    log("[Sentinel] Reverted the last Sentinel patch.")
+end
+
+local function sentinelClose()
+    if sentinelPanel then sentinelPanel:Destroy(); sentinelPanel = nil end
+end
+
+local function sentinelOpen()
+    if sentinelPanel then sentinelPanel:Destroy() end
+    sentinelPanel = mk("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.new(0.7, 0, 0.6, 0), BackgroundColor3 = C.panel,
+        BorderSizePixel = 0, ZIndex = 70
+    }, root)
+    corner(sentinelPanel, 8)
+    stroke(sentinelPanel, C.green)
+    mk("TextLabel", { BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 8),
+        Size = UDim2.new(1, -160, 0, 22), Text = "SENTINEL - STATIC ANALYSIS & SAFE AUTO-PATCH",
+        TextColor3 = C.green, TextSize = 13, Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 71 }, sentinelPanel)
+    local body = mk("TextBox", { Position = UDim2.fromOffset(12, 38), Size = UDim2.new(1, -24, 1, -86),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, Text = "", TextColor3 = C.text,
+        TextSize = 11, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, MultiLine = true,
+        ClearTextOnFocus = false, TextEditable = false, ZIndex = 71 }, sentinelPanel)
+    corner(body, 5)
+
+    local function render()
+        if not SentinelEngine then
+            body.Text = "HyperionSentinel module not installed.\n\nPlace HyperionModules/HyperionSentinel.lua as a child ModuleScript named 'HyperionSentinel'."
+            return
+        end
+        local findings = sentinelScan() or {}
+        local lines = { SentinelEngine.summaryText(findings), "" }
+        local shown = 0
+        for _, f in ipairs(findings) do
+            if shown >= 60 then break end
+            table.insert(lines, string.format("[%s] %s%s", f.severity or "INFO", f.message or f.rule,
+                f.autoSafe and "  (auto-safe)" or ""))
+            shown = shown + 1
+        end
+        if #findings == 0 then table.insert(lines, "No issues detected.") end
+        body.Text = table.concat(lines, "\n")
+    end
+
+    local scanBtn = button(sentinelPanel, "Scan", C.cyan)
+    scanBtn.Position = UDim2.new(1, -74, 0, 8); scanBtn.Size = UDim2.fromOffset(62, 22); scanBtn.ZIndex = 72
+    local fixBtn = button(sentinelPanel, "Auto-fix safe", C.green)
+    fixBtn.Position = UDim2.new(0, 12, 1, -40); fixBtn.Size = UDim2.fromOffset(120, 26); fixBtn.ZIndex = 72
+    local undoBtn = button(sentinelPanel, "Undo", C.yellow)
+    undoBtn.Position = UDim2.new(0, 142, 1, -40); undoBtn.Size = UDim2.fromOffset(80, 26); undoBtn.ZIndex = 72
+    local closeBtn = button(sentinelPanel, "Close", C.muted)
+    closeBtn.Position = UDim2.new(1, -92, 1, -40); closeBtn.Size = UDim2.fromOffset(80, 26); closeBtn.ZIndex = 72
+
+    scanBtn.Activated:Connect(safeAction("SentinelScan", render))
+    fixBtn.Activated:Connect(safeAction("SentinelFix", function() sentinelApplySafe(); render() end))
+    undoBtn.Activated:Connect(safeAction("SentinelUndo", function() sentinelUndo(); render() end))
+    closeBtn.Activated:Connect(safeAction("SentinelClose", sentinelClose))
+    render()
+end
+
+extraBtns.sentinel.Activated:Connect(safeAction("Sentinel", sentinelOpen))
+
+-- Background scanner: keeps watching the active document and reports when the
+-- number of findings changes. It never edits anything on its own.
+if SentinelEngine then
+    task.spawn(function()
+        while root.Parent do
+            task.wait(20)
+            local ok, err = pcall(function()
+                local src = editor.Text or ""
+                local key = hashSource(src, docLang(), "SENT")
+                if key ~= sentinelLastKey then
+                    sentinelLastKey = key
+                    local findings = sentinelScan() or {}
+                    if #findings ~= sentinelLastCount then
+                        sentinelLastCount = #findings
+                        local autoSafe = 0
+                        for _, f in ipairs(findings) do if f.autoSafe then autoSafe = autoSafe + 1 end end
+                        log(string.format("[Sentinel] Scan: %s. %d auto-safe fix(es) available.",
+                            SentinelEngine.summaryText(findings), autoSafe))
+                    end
+                end
+            end)
+            if not ok then
+                log("[Sentinel] Background scan error: " .. safeErrorText(err))
+            end
+        end
+    end)
+end
+
 end
 
 -- ============================================================================
