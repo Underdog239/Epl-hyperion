@@ -2110,8 +2110,11 @@ function Parser:parseBlock(stopValues)
             end
             if hit then break end
         end
+        local before = self.pos
         local s = self:parseStatement()
         if s then table.insert(body, s) else break end
+        -- Progress guarantee: a handler that consumes nothing would hang here.
+        if self.pos == before then self:take() end
     end
     return body
 end
@@ -2987,6 +2990,24 @@ function Optimizer.optimizeAST(node)
         local newBody = {}
         for _, s in ipairs(node.body or {}) do table.insert(newBody, Optimizer.optimizeAST(s)) end
         node.body = newBody
+        return node
+    elseif node.tag == "function" then
+        local nb = {}
+        for _, s in ipairs(node.body or {}) do table.insert(nb, Optimizer.optimizeAST(s)) end
+        node.body = nb
+        return node
+    elseif node.tag == "return" or node.tag == "expr_stmt" then
+        node.expr = Optimizer.optimizeAST(node.expr)
+        return node
+    elseif node.tag == "call" then
+        node.callee = Optimizer.optimizeAST(node.callee)
+        local na = {}
+        for _, a in ipairs(node.args or {}) do table.insert(na, Optimizer.optimizeAST(a)) end
+        node.args = na
+        return node
+    elseif node.tag == "member" or node.tag == "unary" then
+        if node.object then node.object = Optimizer.optimizeAST(node.object) end
+        if node.operand then node.operand = Optimizer.optimizeAST(node.operand) end
         return node
     elseif node.tag == "while" or node.tag == "if" then
         node.cond = Optimizer.optimizeAST(node.cond)
@@ -4561,15 +4582,35 @@ function VM.init(irData, customEnv)
         return string.rep(s, n)
     end
     safeString.format = function(fmt, ...)
-        if type(fmt) == "string" and fmt:match("%d%d%d%d%d%d%d") then
-            VM.state = "HALTED"
-            error("[Hyperion VM] string.format width too large.", 0)
+        if type(fmt) == "string" then
+            -- Reject any width/precision that could allocate an enormous string
+            -- before string.format is allowed to run.
+            for spec in fmt:gmatch("%%[%-%+ #0]*%d*%.?%d*[a-zA-Z]") do
+                for digits in spec:gmatch("%d+") do
+                    local n = tonumber(digits)
+                    if n and n > 100000 then
+                        VM.state = "HALTED"
+                        error("[Hyperion VM] string.format width/precision too large.", 0)
+                    end
+                end
+            end
         end
         return tooLarge(string.format(fmt, ...))
     end
     local safeTable = {}
     for k, v in pairs(table) do safeTable[k] = v end
     safeTable.concat = function(t, sep, i, j)
+        if type(t) == "table" then
+            local joiner = sep == nil and "" or tostring(sep)
+            local from, to = i or 1, j or #t
+            local total = 0
+            for k = from, to do total = total + #tostring(t[k]) end
+            total = total + #joiner * math.max(0, to - from)
+            if total > CONFIG.MAX_OUTPUT_BYTES then
+                VM.state = "HALTED"
+                error("[Hyperion VM] table.concat result would exceed the sandbox size limit.", 0)
+            end
+        end
         return tooLarge(table.concat(t, sep, i, j))
     end
 
@@ -5209,6 +5250,7 @@ end
 function Profiler.reset()
     Profiler.timings = { lex = 0, parse = 0, semantic = 0, ir = 0, optimize = 0, target = 0, runtime = 0 }
     Profiler.counts = { tokens = 0, astNodes = 0, irInstructions = 0 }
+    Profiler.maxLineHits = 1
 end
 
 local TestRunner = {}
@@ -5762,6 +5804,16 @@ function TestRunner.runAll()
                 VM.init(ir)
                 VM.runContinuous()
                 return table.concat(out, "|") == "42"
+            end
+        },
+        {
+            name = "Sandbox: string.format width guard",
+            fn = function()
+                local ast = parseSourceToAST('set s = string.format("%200000d", 5)', "EPL")
+                local ir = HyperionIR.fromAST(ast)
+                VM.init(ir)
+                VM.runContinuous()
+                return VM.state == "HALTED"
             end
         },
     }

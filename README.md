@@ -47,7 +47,7 @@ Hyperion is a small teaching-language (**EPL**) plus a full polyglot toolchain t
 - **Static type inference & IntelliSense** — a conservative type pass (number / string / bool / nil / table / function / any) that powers autocomplete (symbols, keywords, member access), hover types, go-to-definition, find-references and document-wide rename.
 - **Debugger** — line breakpoints with optional **conditions**, Step / Continue / **Back (time-travel reverse execution)**, and a live inspector (registers, call stack, environment) with user **watch expressions**.
 - **IDE** — multi-document tabs, syntax highlighting driven by the real lexer (per language), four themes, a terminal, a Hyperion console-error viewer, and Base64 share-code export/import.
-- **Self-test suite** — 44 built-in tests (Tests button), all passing.
+- **Self-test suite** — 45 built-in tests (Tests button), all passing.
 
 ## Safety limits
 
