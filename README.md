@@ -69,3 +69,4 @@ Source ≤ 100 KB, tokens ≤ 20k, AST nodes ≤ 12k, IR ≤ 25k instructions / 
 - `HyperionModules/HyperionLanguages.lua` — optional multi-language ModuleScript override (C, C+, C++, Java, English, Bytecode, Luau).
 - `HyperionModules/HyperionStdlib.lua` — optional standard-library ModuleScript override (named `HyperionStdlib`).
 - `HyperionModules/HyperionSentinel.lua` — self-wiring static analyzer + conservative auto-patcher (named `HyperionSentinel`).
+67 nameer boy
